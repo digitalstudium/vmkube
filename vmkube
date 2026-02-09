@@ -19,6 +19,37 @@ NETWORK_NETMASK = "255.255.248.0"
 CLUSTER_PREFIX = "vmkube"
 ISO_NAME = "metal-amd64.iso"
 ISO_URL = f"https://github.com/siderolabs/talos/releases/latest/download/{ISO_NAME}"
+REGISTRY_SPECS: list[tuple[str, int]] = [
+    ("docker.io", 5000),
+    ("registry.k8s.io", 5001),
+    ("gcr.io", 5003),
+    ("ghcr.io", 5004),
+]
+
+DEFAULT_CONFIG_TOML = """\
+base_dir = "/var/lib/vmkube"  # Base directory for VMKube files and virtual machines
+cluster_count = 1  # Number of Kubernetes clusters to create
+worker_nodes_per_cluster = 1  # Number of worker nodes per cluster
+control_plane_nodes_per_cluster = 1  # Number of control plane nodes per cluster
+local_registries = false  # Create local docker registries that proxy to Docker Hub
+
+# Warning! Overcommit is possible for memory and CPU, but not for disk.
+[control_plane_node]
+cpus = 2  # Number of CPU cores for each control plane node
+ram = 2048  # RAM in MB for each control plane node
+system_disk = 10  # Disk space in GB for system, Docker images, and ephemeral storage
+
+[worker_node]
+cpus = 2  # Number of CPU cores for each worker node
+ram = 4096  # RAM in MB for each worker node
+system_disk = 15  # Disk space in GB for system, Docker images, and ephemeral storage
+storage_disk = 10  # Disk space in GB for Persistent Volume Claims (PVC)
+
+[virtual_network]
+name = "vmkube-network"  # Name of the virtual network for the virtual machines
+bridge = "vmkube-br0"  # Name of the virtual bridge interface for host-VM communication
+subnet = "192.168.192.0"  # Network will use /21 mask (third octet will be 192-199). IPs for VMs and load balancers will be allocated from this subnet
+"""
 
 # global state
 CONFIG = None
@@ -119,176 +150,175 @@ def get_config_path() -> Path:
     return home / ".config" / "vmkube.toml"
 
 
-def load_config():
-    """Load configuration from TOML file"""
+def load_config() -> Config:
+    """Load configuration from TOML file."""
     config_path = get_config_path()
     try:
-        with open(config_path, "rb") as f:
-            config_data = tomllib.load(f)
-
-        config = Config(
-            base_dir=os.path.expanduser(config_data["base_dir"]),
-            cluster_count=config_data["cluster_count"],
-            worker_nodes_per_cluster=config_data["worker_nodes_per_cluster"],
-            control_plane_nodes_per_cluster=config_data[
-                "control_plane_nodes_per_cluster"
-            ],
-            control_plane_node=ControlPlaneNode(**config_data["control_plane_node"]),
-            worker_node=WorkerNode(**config_data["worker_node"]),
-            virtual_network=VirtualNetwork(**config_data["virtual_network"]),
-            local_registries=config_data.get("local_registries", False),
-        )
-
-        info(f"Configuration loaded from {config_path}")
-        return config
-
+        data = read_toml(config_path)
+        config = build_config(data)
     except Exception as e:
         die(f"Failed to load config: {e}")
+    info(f"Configuration loaded from {config_path}")
+    return config
 
 
-def initconfig(force: bool = False):
-    """Generate a default config and write it to ~/.config/vmkube.toml."""
+def read_toml(path: Path) -> dict:
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def build_config(data: dict) -> Config:
+    return Config(
+        base_dir=os.path.expanduser(data["base_dir"]),
+        cluster_count=data["cluster_count"],
+        worker_nodes_per_cluster=data["worker_nodes_per_cluster"],
+        control_plane_nodes_per_cluster=data["control_plane_nodes_per_cluster"],
+        control_plane_node=ControlPlaneNode(**data["control_plane_node"]),
+        worker_node=WorkerNode(**data["worker_node"]),
+        virtual_network=VirtualNetwork(**data["virtual_network"]),
+        local_registries=data.get("local_registries", False),
+    )
+
+
+def initconfig(force: bool = False) -> None:
+    """Write default config to ~/.config/vmkube.toml."""
     username = get_target_username()
-    home = get_user_home(username)
-    config_path = home / ".config" / "vmkube.toml"
-    config_dir = config_path.parent
-
-    default_toml = """\
-base_dir = "/var/lib/vmkube"  # Base directory for VMKube files and virtual machines
-cluster_count = 1  # Number of Kubernetes clusters to create
-worker_nodes_per_cluster = 1  # Number of worker nodes per cluster
-control_plane_nodes_per_cluster = 1  # Number of control plane nodes per cluster
-local_registries = false  # Create local docker registries that proxy to Docker Hub
-
-# Warning! Overcommit is possible for memory and CPU, but not for disk.
-[control_plane_node]
-cpus = 2  # Number of CPU cores for each control plane node
-ram = 2048  # RAM in MB for each control plane node
-system_disk = 10  # Disk space in GB for system, Docker images, and ephemeral storage
-
-[worker_node]
-cpus = 2  # Number of CPU cores for each worker node
-ram = 4096  # RAM in MB for each worker node
-system_disk = 15  # Disk space in GB for system, Docker images, and ephemeral storage
-storage_disk = 10  # Disk space in GB for Persistent Volume Claims (PVC)
-
-[virtual_network]
-name = "vmkube-network"  # Name of the virtual network for the virtual machines
-bridge = "vmkube-br0"  # Name of the virtual bridge interface for host-VM communication
-subnet = "192.168.192.0"  # Network will use /21 mask (third octet will be 192-199). IPs for VMs and load balancers will be allocated from this subnet
-"""
-
-    config_dir.mkdir(parents=True, exist_ok=True)
-
-    if config_path.exists() and not force:
-        die(f"Config already exists: {config_path} (use --force to overwrite)")
-
-    config_path.write_text(default_toml)
-    config_path.chmod(0o644)
-
-    # If running under sudo, ensure the file belongs to the invoking user
-    if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
-        shutil.chown(config_dir, username, username)
-        shutil.chown(config_path, username, username)
-
+    config_path = get_config_path()
+    ensure_parent_dir(config_path)
+    refuse_overwrite(config_path, force)
+    write_config_file(config_path, DEFAULT_CONFIG_TOML)
+    chown_config_if_sudo(config_path, username)
     ok(f"Wrote default config to: {config_path}")
 
 
+def ensure_parent_dir(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def refuse_overwrite(path: Path, force: bool) -> None:
+    if path.exists() and not force:
+        die(f"Config already exists: {path} (use --force to overwrite)")
+
+
+def write_config_file(path: Path, content: str) -> None:
+    path.write_text(content)
+    path.chmod(0o644)
+
+
+def chown_config_if_sudo(config_path: Path, username: str) -> None:
+    if os.geteuid() != 0 or not os.environ.get("SUDO_USER"):
+        return
+    shutil.chown(config_path.parent, username, username)
+    shutil.chown(config_path, username, username)
+
+
 # local registries
-def start_caching_registries():
+def start_caching_registries() -> None:
     """Start pull-through caching registries if enabled in config."""
     if not CONFIG.local_registries:
         return
-
     step("Starting pull-through image cache registries")
-
-    registries = [
-        ("docker.io", 5000),
-        ("registry.k8s.io", 5001),
-        ("gcr.io", 5003),
-        ("ghcr.io", 5004),
-    ]
-
-    for registry_name, port in registries:
-        container_name = f"registry-{registry_name}"
-
-        # Check if container is already running
-        result = run_shell(
-            [
-                "docker",
-                "ps",
-                "--filter",
-                f"name={container_name}",
-                "--format",
-                "{{.Names}}",
-            ],
-            check=False,
-        )
-        if container_name in result.stdout:
-            info(f"Caching registry for {registry_name} already running")
-            continue
-
-        info(f"Starting caching registry for {registry_name} on port {port}")
-        run_shell(
-            [
-                "docker",
-                "run",
-                "-d",
-                "-p",
-                f"{port}:5000",
-                "-e",
-                f"REGISTRY_PROXY_REMOTEURL=https://{registry_name}",
-                "--restart",
-                "always",
-                "--name",
-                container_name,
-                "registry:2",
-            ],
-            check=False,
-        )
-
+    for remote, port in REGISTRY_SPECS:
+        ensure_registry_running(remote, port)
     ok("Caching registries started")
 
 
-def remove_caching_registries():
+def remove_caching_registries() -> None:
     """Remove pull-through caching registries if enabled."""
     if not CONFIG.local_registries:
         return
-
     step("Removing pull-through image cache registries")
-
-    registries = ["docker.io", "registry.k8s.io", "gcr.io", "ghcr.io"]
-
-    for registry_name in registries:
-        container_name = f"registry-{registry_name}"
-        info(f"Removing {container_name}")
-        run_shell(["docker", "rm", "-f", container_name], check=False)
-
+    for remote, _ in REGISTRY_SPECS:
+        remove_registry_container(remote)
     ok("Caching registries removed")
+
+
+def ensure_registry_running(remote: str, port: int) -> None:
+    name = registry_container_name(remote)
+    if is_container_running(name):
+        info(f"Caching registry for {remote} already running")
+        return
+    info(f"Starting caching registry for {remote} on port {port}")
+    run_shell(registry_run_cmd(name, remote, port), check=False)
+
+
+def remove_registry_container(remote: str) -> None:
+    name = registry_container_name(remote)
+    info(f"Removing {name}")
+    run_shell(["docker", "rm", "-f", name], check=False)
+
+
+def registry_container_name(remote: str) -> str:
+    return f"registry-{remote}"
+
+
+def is_container_running(name: str) -> bool:
+    result = run_shell(
+        ["docker", "ps", "--filter", f"name={name}", "--format", "{{.Names}}"],
+        check=False,
+    )
+    return name in (result.stdout or "")
+
+
+def registry_run_cmd(name: str, remote: str, port: int) -> list[str]:
+    return [
+        "docker",
+        "run",
+        "-d",
+        "-p",
+        f"{port}:5000",
+        "-e",
+        f"REGISTRY_PROXY_REMOTEURL=https://{remote}",
+        "--restart",
+        "always",
+        "--name",
+        name,
+        "registry:2",
+    ]
 
 
 def run_shell(
     cmd: list[str], check: bool = True, verbose: bool = False, **kwargs
 ) -> subprocess.CompletedProcess:
-    """Run a command and return the result."""
+    """Run command and return CompletedProcess (or CalledProcessError if check=False)."""
     try:
-        result = subprocess.run(
-            cmd, check=check, capture_output=True, text=True, **kwargs
-        )
-        if verbose:
-            info(f"$ {' '.join(cmd)}")
-            if result.stdout.strip():
-                info(result.stdout.strip())
+        result = _subprocess_run(cmd, check=check, **kwargs)
+        _log_verbose(cmd, result, verbose)
         return result
     except subprocess.CalledProcessError as e:
-        error(f"Command failed: {' '.join(e.cmd)}")
-        if e.stdout and e.stdout.strip():
-            error(f"stdout: {e.stdout.strip()}")
-        if e.stderr and e.stderr.strip():
-            error(f"stderr: {e.stderr.strip()}")
+        _log_subprocess_error(e)
         if check:
             raise
         return e
+
+
+def _subprocess_run(
+    cmd: list[str], check: bool, **kwargs
+) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, check=check, capture_output=True, text=True, **kwargs)
+
+
+def _log_verbose(
+    cmd: list[str], result: subprocess.CompletedProcess, verbose: bool
+) -> None:
+    if not verbose:
+        return
+    info(f"$ {' '.join(cmd)}")
+    out = (result.stdout or "").strip()
+    if out:
+        info(out)
+
+
+def _log_subprocess_error(e: subprocess.CalledProcessError) -> None:
+    error(f"Command failed: {' '.join(e.cmd)}")
+    _log_stream("stdout", e.stdout)
+    _log_stream("stderr", e.stderr)
+
+
+def _log_stream(name: str, value: Optional[str]) -> None:
+    text = (value or "").strip()
+    if text:
+        error(f"{name}: {text}")
 
 
 def need(cmd: str):
@@ -424,12 +454,11 @@ def get_all_vm_names() -> set[str]:
     return {name.strip() for name in result.stdout.splitlines() if name.strip()}
 
 
-def destroy_vm(vm_name: str, existing_vms: set[str]):
+def destroy_vm(vm_name: str, existing_vms: Optional[set[str]] = None) -> None:
     """Destroy and undefine a single VM with its storage."""
-    if vm_name not in existing_vms:
+    if existing_vms is not None and vm_name not in existing_vms:
         info(f"  {vm_name} — already absent, skipping")
         return
-
     info(f"  {vm_name} — removing...")
     run_shell(["virsh", "destroy", vm_name], check=False)
     run_shell(["virsh", "undefine", vm_name, "--remove-all-storage"], check=False)
@@ -1650,61 +1679,93 @@ def remove_kubeconfig():
     kubeconfig.unlink(missing_ok=True)
 
 
-def down(force: bool = False, remove_all: bool = False):
+def down(force: bool = False, remove_all: bool = False) -> None:
     """Cleanup resources."""
     global CONFIG, BASE_DIR
     setup_sudo_user()
     print_cleanup_warning(remove_all)
-
-    if not force:
-        confirm = input("Type 'yes' to proceed: ").strip()
-        if confirm != "yes":
-            info("Cleanup cancelled")
-            return
-
-    if CONFIG is None:
-        try:
-            CONFIG = load_config()
-        except Exception as e:
-            warn(f"Could not load config: {e}")
-
+    if not confirm_cleanup(force):
+        info("Cleanup cancelled")
+        return
+    CONFIG = CONFIG or load_config_optional()
     BASE_DIR = Path(CONFIG.base_dir) if CONFIG else None
-
-    # Get VM list ONCE
     existing_vms = get_all_vm_names()
-
-    if CONFIG is not None:
-        remove_kubeconfig()
-        cleanup_control_plane_nodes(existing_vms)
-        cleanup_worker_nodes(existing_vms)
-        remove_virtual_network()
-        # Remove caching registries only if --all flag is specified
-        if remove_all and CONFIG.local_registries:
-            remove_caching_registries()
-    else:
-        cleanup_all_vms_by_pattern()
-        remove_network_by_default_name()
-        # Only remove caching registries if --all flag is specified
-        if remove_all:
-            remove_caching_registries()
-
+    cleanup_everything(existing_vms, remove_all)
     remove_leftover_bridge()
-    if BASE_DIR:
-        cleanup_data_directories()
-
-    # Remove ISO image if --all flag is specified
-    if remove_all and BASE_DIR:
-        iso_path = BASE_DIR / ISO_NAME
-        if iso_path.exists():
-            step(f"Removing ISO image: {iso_path}")
-            iso_path.unlink(missing_ok=True)
-            ok(f"ISO image removed: {iso_path}")
-
+    cleanup_data_if_present()
+    remove_iso_if_requested(remove_all)
     ok("Cleanup complete!")
 
 
-def up():
-    """Main execution function"""
+def confirm_cleanup(force: bool) -> bool:
+    if force:
+        return True
+    return input("Type 'yes' to proceed: ").strip() == "yes"
+
+
+def load_config_optional() -> Optional[Config]:
+    try:
+        return load_config()
+    except Exception as e:
+        warn(f"Could not load config: {e}")
+        return None
+
+
+def cleanup_everything(existing_vms: set[str], remove_all: bool) -> None:
+    if CONFIG:
+        cleanup_with_config(existing_vms, remove_all)
+        return
+    cleanup_without_config(remove_all)
+
+
+def cleanup_with_config(existing_vms: set[str], remove_all: bool) -> None:
+    remove_kubeconfig()
+    cleanup_control_plane_nodes(existing_vms)
+    cleanup_worker_nodes(existing_vms)
+    remove_virtual_network()
+    if remove_all and CONFIG.local_registries:
+        remove_caching_registries()
+
+
+def cleanup_without_config(remove_all: bool) -> None:
+    cleanup_all_vms_by_pattern()
+    remove_network_by_default_name()
+    if remove_all:
+        remove_caching_registries()
+
+
+def cleanup_data_if_present() -> None:
+    if BASE_DIR:
+        cleanup_data_directories()
+
+
+def remove_iso_if_requested(remove_all: bool) -> None:
+    if not (remove_all and BASE_DIR):
+        return
+    iso_path = BASE_DIR / ISO_NAME
+    if not iso_path.exists():
+        return
+    step(f"Removing ISO image: {iso_path}")
+    iso_path.unlink(missing_ok=True)
+    ok(f"ISO image removed: {iso_path}")
+
+
+def up() -> None:
+    """Main execution function."""
+    prepare_up()
+    check_prerequisites()
+    ensure_local_registry_prereqs()
+    setup_permissions()
+    check_resources()
+    validate_vip_allocation()
+    confirm_or_die()
+    provision_infra()
+    cp_ips, worker_ips = provision_clusters()
+    check_all_clusters_health(cp_ips)
+    print_creation_summary(cp_ips, worker_ips)
+
+
+def prepare_up() -> None:
     global CONFIG
     require_sudo()
     setup_sudo_user()
@@ -1712,35 +1773,31 @@ def up():
     setup_environment()
     setup_signal_handlers()
 
-    check_prerequisites()
 
-    # Check for docker if local_registries is enabled
-    if CONFIG.local_registries:
-        if shutil.which("docker") is None:
-            die("Docker is required for local registries but not found")
-        info("Local registries enabled - will set up pull-through cache")
+def ensure_local_registry_prereqs() -> None:
+    if not CONFIG.local_registries:
+        return
+    if shutil.which("docker") is None:
+        die("Docker is required for local registries but not found")
+    info("Local registries enabled - will set up pull-through cache")
 
-    setup_permissions()
-    check_resources()
-    validate_vip_allocation()
 
+def confirm_or_die() -> None:
     if not confirm_proceed():
         die("Cancelled")
 
+
+def provision_infra() -> None:
     ensure_time_sync()
     setup_working_directory()
     download_talos_iso()
-
-    # Start caching registries before creating network
     if CONFIG.local_registries:
         start_caching_registries()
-
     recreate_network()
 
-    cp_ips, worker_ips = create_and_setup_clusters()
 
-    check_all_clusters_health(cp_ips)
-    print_creation_summary(cp_ips, worker_ips)
+def provision_clusters() -> tuple[dict, dict]:
+    return create_and_setup_clusters()
 
 
 def main():
