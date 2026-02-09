@@ -96,6 +96,7 @@ class Config:
     control_plane_node: ControlPlaneNode
     worker_node: WorkerNode
     virtual_network: VirtualNetwork
+    local_registries: bool = False
 
 
 def load_config():
@@ -116,6 +117,9 @@ def load_config():
             control_plane_node=ControlPlaneNode(**config_data["control_plane_node"]),
             worker_node=WorkerNode(**config_data["worker_node"]),
             virtual_network=VirtualNetwork(**config_data["virtual_network"]),
+            local_registries=config_data.get(
+                "local_registries", False
+            ),  # Add this line
         )
 
         info(f"Configuration loaded from {config_path}")
@@ -123,6 +127,79 @@ def load_config():
 
     except Exception as e:
         die(f"Failed to load config: {e}")
+
+
+# local registries
+def start_caching_registries():
+    """Start pull-through caching registries if enabled in config."""
+    if not CONFIG.local_registries:
+        return
+
+    step("Starting pull-through image cache registries")
+
+    registries = [
+        ("docker.io", 5000),
+        ("registry.k8s.io", 5001),
+        ("gcr.io", 5003),
+        ("ghcr.io", 5004),
+    ]
+
+    for registry_name, port in registries:
+        container_name = f"registry-{registry_name}"
+
+        # Check if container is already running
+        result = run_shell(
+            [
+                "docker",
+                "ps",
+                "--filter",
+                f"name={container_name}",
+                "--format",
+                "{{.Names}}",
+            ],
+            check=False,
+        )
+        if container_name in result.stdout:
+            info(f"Caching registry for {registry_name} already running")
+            continue
+
+        info(f"Starting caching registry for {registry_name} on port {port}")
+        run_shell(
+            [
+                "docker",
+                "run",
+                "-d",
+                "-p",
+                f"{port}:5000",
+                "-e",
+                f"REGISTRY_PROXY_REMOTEURL=https://{registry_name}",
+                "--restart",
+                "always",
+                "--name",
+                container_name,
+                "registry:2",
+            ],
+            check=False,
+        )
+
+    ok("Caching registries started")
+
+
+def remove_caching_registries():
+    """Remove pull-through caching registries if enabled."""
+    if not CONFIG.local_registries:
+        return
+
+    step("Removing pull-through image cache registries")
+
+    registries = ["docker.io", "registry.k8s.io", "gcr.io", "ghcr.io"]
+
+    for registry_name in registries:
+        container_name = f"registry-{registry_name}"
+        info(f"Removing {container_name}")
+        run_shell(["docker", "rm", "-f", container_name], check=False)
+
+    ok("Caching registries removed")
 
 
 def run_shell(
@@ -222,7 +299,7 @@ def signal_handler(signum, frame):
     """Handle signals for cleanup"""
     print("\n")
     warn("Script interrupted -> cleanup, please wait for a while...")
-    down()
+    down(force=True, remove_all=False)  # Don't remove registries/ISO on interrupt
     sys.exit(1)
 
 
@@ -298,7 +375,7 @@ def check_bridge_exists() -> bool:
     return result.returncode == 0
 
 
-def print_cleanup_warning():
+def print_cleanup_warning(remove_all: bool = False):
     """Print destructive operation warning banner."""
     print()
     print("=" * 60)
@@ -309,6 +386,11 @@ def print_cleanup_warning():
     print("  - All worker VMs (worker-*)")
     print("  - Virtual network and bridge")
     print("  - All disk images and configuration files")
+
+    if remove_all:
+        print("  - Local caching registries (--all flag specified)")
+        print("  - Talos ISO image")
+
     print()
     print("This operation is IRREVERSIBLE!")
     print("=" * 60)
@@ -1109,20 +1191,35 @@ def generate_talos_configuration(cluster_num: int, cp_ip: str):
     step(f"Cluster {cluster_num}: generating Talos config")
     cfgdir = BASE_DIR / f"{CLUSTER_PREFIX}-{cluster_num}" / "configs"
 
-    run_shell(
-        [
-            "talosctl",
-            "gen",
-            "config",
-            f"{CLUSTER_PREFIX}-{cluster_num}",
-            f"https://{cp_ip}:6443",
-            "--install-disk",
-            "/dev/vda",
-            "-o",
-            str(cfgdir),
-        ]
-    )
+    cmd = [
+        "talosctl",
+        "gen",
+        "config",
+        f"{CLUSTER_PREFIX}-{cluster_num}",
+        f"https://{cp_ip}:6443",
+        "--install-disk",
+        "/dev/vda",
+        "-o",
+        str(cfgdir),
+    ]
 
+    # Add registry mirrors if enabled
+    if CONFIG.local_registries:
+        network_gateway = get_network_gateway(CONFIG)
+        cmd.extend(
+            [
+                "--registry-mirror",
+                f"docker.io=http://{network_gateway}:5000",
+                "--registry-mirror",
+                f"registry.k8s.io=http://{network_gateway}:5001",
+                "--registry-mirror",
+                f"gcr.io=http://{network_gateway}:5003",
+                "--registry-mirror",
+                f"ghcr.io=http://{network_gateway}:5004",
+            ]
+        )
+
+    run_shell(cmd)
     ok(f"Config generated: {cfgdir}")
 
 
@@ -1249,17 +1346,18 @@ def remove_kubeconfig():
     kubeconfig.unlink(missing_ok=True)
 
 
-def down(force: bool = False):
+def down(force: bool = False, remove_all: bool = False):
     """Cleanup resources."""
     global CONFIG, BASE_DIR
     setup_sudo_user()
-    print_cleanup_warning()
+    print_cleanup_warning(remove_all)
 
     if not force:
         confirm = input("Type 'yes' to proceed: ").strip()
         if confirm != "yes":
             info("Cleanup cancelled")
             return
+
     if CONFIG is None:
         try:
             CONFIG = load_config()
@@ -1276,13 +1374,27 @@ def down(force: bool = False):
         cleanup_control_plane_nodes(existing_vms)
         cleanup_worker_nodes(existing_vms)
         remove_virtual_network()
+        # Remove caching registries only if --all flag is specified
+        if remove_all and CONFIG.local_registries:
+            remove_caching_registries()
     else:
         cleanup_all_vms_by_pattern()
         remove_network_by_default_name()
+        # Only remove caching registries if --all flag is specified
+        if remove_all:
+            remove_caching_registries()
 
     remove_leftover_bridge()
     if BASE_DIR:
         cleanup_data_directories()
+
+    # Remove ISO image if --all flag is specified
+    if remove_all and BASE_DIR:
+        iso_path = BASE_DIR / ISO_NAME
+        if iso_path.exists():
+            step(f"Removing ISO image: {iso_path}")
+            iso_path.unlink(missing_ok=True)
+            ok(f"ISO image removed: {iso_path}")
 
     ok("Cleanup complete!")
 
@@ -1297,6 +1409,13 @@ def up():
     setup_signal_handlers()
 
     check_prerequisites()
+
+    # Check for docker if local_registries is enabled
+    if CONFIG.local_registries:
+        if shutil.which("docker") is None:
+            die("Docker is required for local registries but not found")
+        info("Local registries enabled - will set up pull-through cache")
+
     setup_permissions()
     check_resources()
 
@@ -1306,6 +1425,11 @@ def up():
     ensure_time_sync()
     setup_working_directory()
     download_talos_iso()
+
+    # Start caching registries before creating network
+    if CONFIG.local_registries:
+        start_caching_registries()
+
     recreate_network()
 
     cp_ips, worker_ips = create_and_setup_clusters()
@@ -1318,7 +1442,8 @@ def main():
     if sys.argv[1] == "up":
         up()
     elif sys.argv[1] == "down":
-        down()
+        remove_all = "--all" in sys.argv
+        down(force=False, remove_all=remove_all)
     else:
         print("Invalid action")
 
