@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import pwd
 import shutil
 import signal
 import socket
@@ -99,16 +100,34 @@ class Config:
     local_registries: bool = False
 
 
+def get_target_username() -> str:
+    """Username whose home dir we should use for user-scoped files."""
+    return (
+        os.environ.get("SUDO_USER")
+        or os.environ.get("USER")
+        or pwd.getpwuid(os.getuid()).pw_name
+    )
+
+
+def get_user_home(username: str) -> Path:
+    return Path(pwd.getpwnam(username).pw_dir)
+
+
+def get_config_path() -> Path:
+    username = get_target_username()
+    home = get_user_home(username)
+    return home / ".config" / "vmkube.toml"
+
+
 def load_config():
     """Load configuration from TOML file"""
-    config_path = f"/home/{SUDO_USER}/.config/vmkube.toml"
+    config_path = get_config_path()
     try:
         with open(config_path, "rb") as f:
             config_data = tomllib.load(f)
 
-        # Create config object
         config = Config(
-            base_dir=config_data["base_dir"],
+            base_dir=os.path.expanduser(config_data["base_dir"]),
             cluster_count=config_data["cluster_count"],
             worker_nodes_per_cluster=config_data["worker_nodes_per_cluster"],
             control_plane_nodes_per_cluster=config_data[
@@ -117,9 +136,7 @@ def load_config():
             control_plane_node=ControlPlaneNode(**config_data["control_plane_node"]),
             worker_node=WorkerNode(**config_data["worker_node"]),
             virtual_network=VirtualNetwork(**config_data["virtual_network"]),
-            local_registries=config_data.get(
-                "local_registries", False
-            ),  # Add this line
+            local_registries=config_data.get("local_registries", False),
         )
 
         info(f"Configuration loaded from {config_path}")
@@ -127,6 +144,53 @@ def load_config():
 
     except Exception as e:
         die(f"Failed to load config: {e}")
+
+
+def initconfig(force: bool = False):
+    """Generate a default config and write it to ~/.config/vmkube.toml."""
+    username = get_target_username()
+    home = get_user_home(username)
+    config_path = home / ".config" / "vmkube.toml"
+    config_dir = config_path.parent
+
+    default_toml = """\
+base_dir = "/var/lib/vmkube"
+cluster_count = 1
+worker_nodes_per_cluster = 1
+control_plane_nodes_per_cluster = 1
+local_registries = false
+
+[control_plane_node]
+cpus = 2
+ram = 2048
+system_disk = 10
+
+[worker_node]
+cpus = 2
+ram = 4096
+system_disk = 15
+storage_disk = 10
+
+[virtual_network]
+name = "vmkube-network"
+bridge = "vmkube-br0"
+subnet = "192.168.192.0"
+"""
+
+    config_dir.mkdir(parents=True, exist_ok=True)
+
+    if config_path.exists() and not force:
+        die(f"Config already exists: {config_path} (use --force to overwrite)")
+
+    config_path.write_text(default_toml)
+    config_path.chmod(0o644)
+
+    # If running under sudo, ensure the file belongs to the invoking user
+    if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
+        shutil.chown(config_dir, username, username)
+        shutil.chown(config_path, username, username)
+
+    ok(f"Wrote default config to: {config_path}")
 
 
 # local registries
@@ -1679,13 +1743,21 @@ def up():
 
 
 def main():
+    if len(sys.argv) < 2:
+        print("Usage: vmkube {up|down|initconfig} [--all|--force]")
+        sys.exit(1)
+
     if sys.argv[1] == "up":
         up()
     elif sys.argv[1] == "down":
         remove_all = "--all" in sys.argv
         down(force=False, remove_all=remove_all)
+    elif sys.argv[1] == "initconfig":
+        force = "--force" in sys.argv
+        initconfig(force=force)
     else:
         print("Invalid action")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

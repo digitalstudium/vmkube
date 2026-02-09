@@ -7,15 +7,7 @@ Create virtual machines backed Kubernetes clusters on your laptop with a single 
 
 ## How it works
 
-`vmkube` creates Kubernetes clusters using KVM virtual machines. It handles everything automatically:
-
-1. Creates virtual machines for control plane and worker nodes
-2. Sets up isolated networking
-3. Installs Talos Linux on each VM
-4. Bootstraps a production-ready Kubernetes cluster
-5. Provides kubeconfig for immediate access
-
-When you're done, one command removes all VMs, networks, and disks.
+`vmkube` uses `virsh` and `talosctl` under the hood. It creates virtual machines for control plane and worker nodes, sets up isolated networking, installs Talos Linux on each VM, bootstraps Kubernetes clusters, and provides kubeconfig for immediate access. When you're done, one command removes all VMs, networks, and disks.
 
 ## Quick start
 
@@ -35,7 +27,12 @@ sudo apt install -y vmkube
 
 ### Create config
 
-pick `vmkube.toml` from this repository, modify it if necessary and place it here: `~/.config/vmkube.toml`
+```bash
+vmkube initconfig
+```
+
+it will create `~/.config/vmkube.toml` file with default configuration.
+Review and modify it if necessary.
 
 ### Create clusters
 
@@ -48,8 +45,8 @@ sudo vmkube up
 After creation, access Kubernetes with:
 
 ```bash
+export KUBECONFIG=~/.kube/vmkube
 kubectl config get-contexts
-kubectl use-context admin@vmkube-1
 kubectl get nodes
 ```
 
