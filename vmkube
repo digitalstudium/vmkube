@@ -15,11 +15,11 @@ from typing import List, Optional, Tuple
 import tomllib
 
 # constants
-NETWORK_NETMASK = "255.255.248.0"
-CLUSTER_PREFIX = "vmkube"
+NETWORK_MASK = "255.255.248.0"
+CLUSTER_NAME_PREFIX = "vmkube"
 ISO_NAME = "metal-amd64.iso"
 ISO_URL = f"https://github.com/siderolabs/talos/releases/latest/download/{ISO_NAME}"
-REGISTRY_SPECS: list[tuple[str, int]] = [
+REGISTRIES_PORTS: list[tuple[str, int]] = [
     ("docker.io", 5000),
     ("registry.k8s.io", 5001),
     ("gcr.io", 5003),
@@ -53,7 +53,7 @@ subnet = "192.168.192.0"  # Network will use /21 mask (third octet will be 192-1
 
 # global state
 CONFIG = None
-SUDO_USER = None
+USER = None
 BASE_DIR = None
 NETWORK_GATEWAY = None
 DHCP_START = None
@@ -131,8 +131,7 @@ class Config:
     local_registries: bool = False
 
 
-def get_target_username() -> str:
-    """Username whose home dir we should use for user-scoped files."""
+def get_user() -> str:
     return (
         os.environ.get("SUDO_USER")
         or os.environ.get("USER")
@@ -140,13 +139,13 @@ def get_target_username() -> str:
     )
 
 
-def get_user_home(username: str) -> Path:
-    return Path(pwd.getpwnam(username).pw_dir)
+def get_user_home(user: str) -> Path:
+    return Path(pwd.getpwnam(user).pw_dir)
 
 
 def get_config_path() -> Path:
-    username = get_target_username()
-    home = get_user_home(username)
+    user = get_user()
+    home = get_user_home(user)
     return home / ".config" / "vmkube.toml"
 
 
@@ -182,10 +181,10 @@ def build_config(data: dict) -> Config:
 
 def initconfig(force: bool = False) -> None:
     """Write default config to ~/.config/vmkube.toml."""
-    username = get_target_username()
+    username = get_user()
     config_path = get_config_path()
     ensure_parent_dir(config_path)
-    refuse_overwrite(config_path, force)
+    refuse_config_overwrite(config_path, force)
     write_config_file(config_path, DEFAULT_CONFIG_TOML)
     chown_config_if_sudo(config_path, username)
     ok(f"Wrote default config to: {config_path}")
@@ -195,7 +194,7 @@ def ensure_parent_dir(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
-def refuse_overwrite(path: Path, force: bool) -> None:
+def refuse_config_overwrite(path: Path, force: bool) -> None:
     if path.exists() and not force:
         die(f"Config already exists: {path} (use --force to overwrite)")
 
@@ -218,7 +217,7 @@ def start_caching_registries() -> None:
     if not CONFIG.local_registries:
         return
     step("Starting pull-through image cache registries")
-    for remote, port in REGISTRY_SPECS:
+    for remote, port in REGISTRIES_PORTS:
         ensure_registry_running(remote, port)
     ok("Caching registries started")
 
@@ -228,7 +227,7 @@ def remove_caching_registries() -> None:
     if not CONFIG.local_registries:
         return
     step("Removing pull-through image cache registries")
-    for remote, _ in REGISTRY_SPECS:
+    for remote, _ in REGISTRIES_PORTS:
         remove_registry_container(remote)
     ok("Caching registries removed")
 
@@ -321,39 +320,33 @@ def _log_stream(name: str, value: Optional[str]) -> None:
         error(f"{name}: {text}")
 
 
-def need(cmd: str):
+def check_if_command_exists(cmd: str):
     """Check if command exists"""
     if shutil.which(cmd) is None:
         die(f"Missing required command: {cmd}")
 
 
-def mb2gb(mb: int) -> float:
+def convert_mb_to_gb(mb: int) -> float:
     """Convert MB to GB"""
     return mb / 1024
 
 
-def get_network_gateway(config_data):
+def get_network_gateway_ip_address(config_data):
     subnet = config_data.virtual_network.subnet
     o1, o2, o3, _ = subnet.split(".")
     return f"{o1}.{o2}.{o3}.1"
 
 
-def get_dhcp_start(config_data):
+def get_dhcp_start_ip_address(config_data):
     subnet = config_data.virtual_network.subnet
     o1, o2, o3, _ = subnet.split(".")
     return f"{o1}.{o2}.{o3}.2"
 
 
-def get_dhcp_end(config_data):
-    """Update DHCP range to exclude all possible VIP addresses."""
+def get_dhcp_end_ip_address(config_data):
     subnet = config_data.virtual_network.subnet
     o1, o2, o3, _ = subnet.split(".")
-
-    if should_enable_vip():
-        # Reserve .240-.250 for VIPs, DHCP ends at .239
-        return f"{o1}.{o2}.{o3}.239"
-    else:
-        return f"{o1}.{o2}.{o3}.254"
+    return f"{o1}.{o2}.{o3}.200"
 
 
 def get_cluster_vip(cluster_num: int) -> str:
@@ -364,12 +357,7 @@ def get_cluster_vip(cluster_num: int) -> str:
     subnet = CONFIG.virtual_network.subnet
     o1, o2, o3, _ = subnet.split(".")
 
-    # Assign VIPs starting from .250 downwards to avoid DHCP conflicts
-    # Cluster 1 gets .250, Cluster 2 gets .249, etc.
-    vip_octet = 250 - (cluster_num - 1)
-
-    if vip_octet < 240:  # Keep some buffer
-        die(f"Too many clusters for VIP allocation. VIP octet would be {vip_octet}")
+    vip_octet = 200 + cluster_num
 
     return f"{o1}.{o2}.{o3}.{vip_octet}"
 
@@ -379,18 +367,7 @@ def should_enable_vip() -> bool:
     return CONFIG.control_plane_nodes_per_cluster > 1
 
 
-def get_vip_ip(config_data):
-    """Calculate VIP address if enabled."""
-    if not should_enable_vip():
-        return None
-
-    subnet = config_data.virtual_network.subnet
-    o1, o2, o3, _ = subnet.split(".")
-    return f"{o1}.{o2}.{o3}.253"  # Last usable IP before .254
-
-
 def create_qemu_disk(size: int, disk_path: str):
-    """Create a disk image"""
     run_shell(
         [
             "qemu-img",
@@ -408,10 +385,10 @@ def require_sudo():
         die("Run with sudo!")
 
 
-def setup_sudo_user():
-    global SUDO_USER
-    SUDO_USER = os.environ.get("SUDO_USER")
-    if not SUDO_USER:
+def setup_user():
+    global USER
+    USER = os.environ.get("SUDO_USER")
+    if not USER:
         die("Run via sudo from a normal user (SUDO_USER empty)")
 
 
@@ -421,21 +398,12 @@ def setup_environment():
     global BASE_DIR, NETWORK_GATEWAY, DHCP_START, DHCP_END
 
     BASE_DIR = Path(CONFIG.base_dir)
-    NETWORK_GATEWAY = get_network_gateway(CONFIG)
-    DHCP_START = get_dhcp_start(CONFIG)
-    DHCP_END = get_dhcp_end(CONFIG)
+    NETWORK_GATEWAY = get_network_gateway_ip_address(CONFIG)
+    DHCP_START = get_dhcp_start_ip_address(CONFIG)
+    DHCP_END = get_dhcp_end_ip_address(CONFIG)
 
     info(f"Base directory: {BASE_DIR}")
-    info(f"User: {SUDO_USER}")
-    if should_enable_vip():
-        # Show VIP range instead of single VIP
-        subnet = CONFIG.virtual_network.subnet
-        o1, o2, o3, _ = subnet.split(".")
-        info(
-            f"VIP range: {o1}.{o2}.{o3}.{250 - (CONFIG.cluster_count - 1)}-{o1}.{o2}.{o3}.250"
-        )
-    else:
-        info("VIP: disabled (single control plane)")
+    info(f"User: {USER}")
 
 
 def signal_handler(signum, frame):
@@ -454,7 +422,7 @@ def get_all_vm_names() -> set[str]:
     return {name.strip() for name in result.stdout.splitlines() if name.strip()}
 
 
-def destroy_vm(vm_name: str, existing_vms: Optional[set[str]] = None) -> None:
+def destroy_vmkube_vm(vm_name: str, existing_vms: Optional[set[str]] = None) -> None:
     """Destroy and undefine a single VM with its storage."""
     if existing_vms is not None and vm_name not in existing_vms:
         info(f"  {vm_name} — already absent, skipping")
@@ -466,11 +434,10 @@ def destroy_vm(vm_name: str, existing_vms: Optional[set[str]] = None) -> None:
 
 
 def cleanup_control_plane_nodes(existing_vms: set[str]):
-    """Cleanup all control plane VMs."""
     step("Removing control plane VMs")
     for c in range(1, CONFIG.cluster_count + 1):
         for cp in range(1, CONFIG.control_plane_nodes_per_cluster + 1):
-            destroy_vm(f"cp-{c}-{cp}", existing_vms)
+            destroy_vmkube_vm(f"cp-{c}-{cp}", existing_vms)
 
 
 def cleanup_worker_nodes(existing_vms: set[str]):
@@ -478,7 +445,7 @@ def cleanup_worker_nodes(existing_vms: set[str]):
     step("Removing worker VMs")
     for c in range(1, CONFIG.cluster_count + 1):
         for w in range(1, CONFIG.worker_nodes_per_cluster + 1):
-            destroy_vm(f"worker-{c}-{w}", existing_vms)
+            destroy_vmkube_vm(f"worker-{c}-{w}", existing_vms)
 
 
 def remove_virtual_network():
@@ -545,7 +512,7 @@ def cleanup_data_directories():
 
     # Remove cluster directories
     if BASE_DIR.exists():
-        for item in BASE_DIR.glob(f"{CLUSTER_PREFIX}-*"):
+        for item in BASE_DIR.glob(f"{CLUSTER_NAME_PREFIX}-*"):
             if item.is_dir():
                 info(f"  Removing directory: {item}")
                 shutil.rmtree(item, ignore_errors=True)
@@ -565,7 +532,7 @@ def cleanup_all_vms_by_pattern():
             if line.strip():
                 vm_name = line.split()[1]
                 if any(pattern in vm_name for pattern in patterns):
-                    destroy_vm(vm_name)
+                    destroy_vmkube_vm(vm_name)
 
 
 def remove_network_by_default_name():
@@ -588,7 +555,7 @@ def setup_permissions():
     BASE_DIR.mkdir(parents=True, exist_ok=True)
 
     # Set ownership
-    shutil.chown(BASE_DIR, SUDO_USER, SUDO_USER)
+    shutil.chown(BASE_DIR, USER, USER)
     BASE_DIR.chmod(0o755)
 
     # Determine libvirt user
@@ -665,14 +632,14 @@ def log_resource_plan(cp, worker, total_cpu, total_ram, total_disk):
         f"Clusters: {CONFIG.cluster_count} | Workers/cluster: {CONFIG.worker_nodes_per_cluster}"
     )
     info(
-        f"Per control plane node: {cp.cpus} vCPU, {mb2gb(cp.ram):.2f}GB RAM, {cp.system_disk}GB system disk"
+        f"Per control plane node: {cp.cpus} vCPU, {convert_mb_to_gb(cp.ram):.2f}GB RAM, {cp.system_disk}GB system disk"
     )
     info(
-        f"Per worker node: {worker.cpus} vCPU, {mb2gb(worker.ram):.2f}GB RAM, {worker.system_disk}GB system disk + {worker.storage_disk}GB storage disk"
+        f"Per worker node: {worker.cpus} vCPU, {convert_mb_to_gb(worker.ram):.2f}GB RAM, {worker.system_disk}GB system disk + {worker.storage_disk}GB storage disk"
     )
     info("=== TOTAL REQUESTED ===")
     info(f"CPU:  {total_cpu} vCPU")
-    info(f"RAM:  {mb2gb(total_ram):.2f}GB")
+    info(f"RAM:  {convert_mb_to_gb(total_ram):.2f}GB")
     info(f"Disk: {total_disk} GB")
 
 
@@ -680,7 +647,7 @@ def log_available_resources(avail_cpu, avail_ram, avail_disk):
     """Log available system resources."""
     info("=== AVAILABLE ===")
     info(f"CPU cores: {avail_cpu}")
-    info(f"RAM:       {mb2gb(avail_ram):.2f}GB")
+    info(f"RAM:       {convert_mb_to_gb(avail_ram):.2f}GB")
     info(f"Disk free: {avail_disk} GB (checked at {BASE_DIR})")
     print()
 
@@ -695,7 +662,7 @@ def check_ram_overcommit(total_ram, avail_ram):
     """Check if RAM requested exceeds available."""
     if total_ram > avail_ram:
         warn(
-            f"RAM overcommit: requested {mb2gb(total_ram):.2f}GB > available {mb2gb(avail_ram):.2f}GB"
+            f"RAM overcommit: requested {convert_mb_to_gb(total_ram):.2f}GB > available {convert_mb_to_gb(avail_ram):.2f}GB"
         )
 
 
@@ -719,7 +686,6 @@ def check_libvirtd_running():
 
 
 def check_resources():
-    """Check system resources - main aggregator function."""
     step("Checking system resources")
 
     cp = CONFIG.control_plane_node
@@ -766,7 +732,7 @@ def create_network_xml():
   <forward mode="nat">
     <nat><port start="1024" end="65535"/></nat>
   </forward>
-  <ip address="{NETWORK_GATEWAY}" netmask="{NETWORK_NETMASK}">
+  <ip address="{NETWORK_GATEWAY}" netmask="{NETWORK_MASK}">
     <dhcp><range start="{DHCP_START}" end="{DHCP_END}"/></dhcp>
   </ip>
 </network>"""
@@ -967,7 +933,7 @@ def create_disk_if_not_exists(disk_size_gb: int, disk_path: Path):
 
 def set_disk_permissions(disk_path: Path):
     """Set appropriate permissions on disk file."""
-    shutil.chown(disk_path, SUDO_USER, SUDO_USER)
+    shutil.chown(disk_path, USER, USER)
     disk_path.chmod(0o644)
 
 
@@ -1016,7 +982,7 @@ def create_vm_with_virt_install(
 
 def get_cluster_directory(cluster_num: int) -> Path:
     """Get the directory path for a specific cluster."""
-    return BASE_DIR / f"{CLUSTER_PREFIX}-{cluster_num}"
+    return BASE_DIR / f"{CLUSTER_NAME_PREFIX}-{cluster_num}"
 
 
 def prepare_control_plane_disk(cluster_num: int, cp_num: int) -> Path:
@@ -1127,11 +1093,11 @@ def check_cluster_health(cluster_num: int, cp_ips: list):
     primary_cp_ip = cp_ips[0]
 
     step(
-        f"Checking health of {CLUSTER_PREFIX}-{cluster_num} (control plane: {primary_cp_ip})"
+        f"Checking health of {CLUSTER_NAME_PREFIX}-{cluster_num} (control plane: {primary_cp_ip})"
     )
 
     config_file = (
-        BASE_DIR / f"{CLUSTER_PREFIX}-{cluster_num}" / "configs" / "talosconfig"
+        BASE_DIR / f"{CLUSTER_NAME_PREFIX}-{cluster_num}" / "configs" / "talosconfig"
     )
 
     env = os.environ.copy()
@@ -1142,7 +1108,7 @@ def check_cluster_health(cluster_num: int, cp_ips: list):
             "talosctl",
             "health",
             "-c",
-            f"{CLUSTER_PREFIX}-{cluster_num}",
+            f"{CLUSTER_NAME_PREFIX}-{cluster_num}",
             "-n",
             primary_cp_ip,
         ],
@@ -1209,7 +1175,7 @@ def check_prerequisites():
         "df",
         "free",
     ]:
-        need(cmd)
+        check_if_command_exists(cmd)
     ok("Prerequisites OK")
 
 
@@ -1223,7 +1189,7 @@ def setup_working_directory():
     """Prepare working directory."""
     step("Preparing working directory")
     BASE_DIR.mkdir(parents=True, exist_ok=True)
-    shutil.chown(BASE_DIR, SUDO_USER, SUDO_USER)
+    shutil.chown(BASE_DIR, USER, USER)
     os.chdir(BASE_DIR)
 
 
@@ -1241,49 +1207,78 @@ def download_talos_iso():
     else:
         ok(f"ISO already exists: {iso_path}")
 
-    shutil.chown(iso_path, SUDO_USER, SUDO_USER)
+    shutil.chown(iso_path, USER, USER)
     iso_path.chmod(0o644)
 
 
-def create_and_setup_clusters() -> Tuple[dict, dict]:
-    """Create VMs and setup all clusters."""
+def create_all_virtual_machines() -> None:
+    """Create all VMs for all clusters."""
     step("Creating VMs")
-    cp_ips = {}  # Now a dict of lists: {cluster_num: [ip1, ip2, ...]}
-    worker_ips = {}
 
-    for c in range(1, CONFIG.cluster_count + 1):
-        setup_cluster_directory(c)
+    for cluster_num in range(1, CONFIG.cluster_count + 1):
+        setup_cluster_directory(cluster_num)
+        create_cluster_virtual_machines(cluster_num)
 
-        # Create multiple control plane nodes
-        for cp in range(1, CONFIG.control_plane_nodes_per_cluster + 1):
-            create_control_plane_vm(f"cp-{c}-{cp}", c, cp)
+    log_virtual_machines_status()
 
-        for w in range(1, CONFIG.worker_nodes_per_cluster + 1):
-            create_worker_vm(f"worker-{c}-{w}", c, w)
 
+def create_cluster_virtual_machines(cluster_num: int) -> None:
+    """Create all VMs for a specific cluster."""
+    create_control_plane_vms_for_cluster(cluster_num)
+    create_worker_vms_for_cluster(cluster_num)
+
+
+def create_control_plane_vms_for_cluster(cluster_num: int) -> None:
+    """Create all control plane VMs for a cluster."""
+    for cp_num in range(1, CONFIG.control_plane_nodes_per_cluster + 1):
+        vm_name = f"cp-{cluster_num}-{cp_num}"
+        create_control_plane_vm(vm_name, cluster_num, cp_num)
+
+
+def create_worker_vms_for_cluster(cluster_num: int) -> None:
+    """Create all worker VMs for a cluster."""
+    for worker_num in range(1, CONFIG.worker_nodes_per_cluster + 1):
+        vm_name = f"worker-{cluster_num}-{worker_num}"
+        create_worker_vm(vm_name, cluster_num, worker_num)
+
+
+def log_virtual_machines_status() -> None:
+    """Log the status of all created VMs."""
     ok("All VMs defined and started")
     info("Currently running VMs:")
     run_shell(["virsh", "list"])
 
+
+def setup_all_clusters() -> Tuple[dict, dict]:
+    """Setup and configure all clusters."""
     step("Waiting for VMs to boot and get IPs...")
 
-    for c in range(1, CONFIG.cluster_count + 1):
-        cp_ip_list, worker_list = setup_single_cluster(c)
-        cp_ips[c] = cp_ip_list
-        worker_ips[c] = worker_list
+    cp_ips = {}
+    worker_ips = {}
+
+    for cluster_num in range(1, CONFIG.cluster_count + 1):
+        cp_ip_list, worker_list = setup_single_cluster(cluster_num)
+        cp_ips[cluster_num] = cp_ip_list
+        worker_ips[cluster_num] = worker_list
 
     return cp_ips, worker_ips
+
+
+def create_and_setup_clusters() -> Tuple[dict, dict]:
+    """Orchestrate VM creation and cluster setup."""
+    create_all_virtual_machines()
+    return setup_all_clusters()
 
 
 def setup_cluster_directory(cluster_num: int):
     """Setup directory structure for a cluster."""
     step(f"Cluster {cluster_num}: directories")
-    cluster_dir = BASE_DIR / f"{CLUSTER_PREFIX}-{cluster_num}"
+    cluster_dir = BASE_DIR / f"{CLUSTER_NAME_PREFIX}-{cluster_num}"
     config_dir = cluster_dir / "configs"
 
     config_dir.mkdir(parents=True, exist_ok=True)
-    shutil.chown(cluster_dir, SUDO_USER, SUDO_USER)
-    shutil.chown(config_dir, SUDO_USER, SUDO_USER)
+    shutil.chown(cluster_dir, USER, USER)
+    shutil.chown(config_dir, USER, USER)
     cluster_dir.chmod(0o755)
     config_dir.chmod(0o755)
 
@@ -1391,7 +1386,7 @@ def get_worker_ips(cluster_num: int) -> list:
 def generate_talos_configuration(cluster_num: int, cp_ip: str):
     """Generate Talos configuration files."""
     step(f"Cluster {cluster_num}: generating Talos config")
-    cfgdir = BASE_DIR / f"{CLUSTER_PREFIX}-{cluster_num}" / "configs"
+    cfgdir = BASE_DIR / f"{CLUSTER_NAME_PREFIX}-{cluster_num}" / "configs"
 
     # Get cluster-specific VIP
     cluster_vip = get_cluster_vip(cluster_num)
@@ -1408,7 +1403,7 @@ def generate_talos_configuration(cluster_num: int, cp_ip: str):
         "talosctl",
         "gen",
         "config",
-        f"{CLUSTER_PREFIX}-{cluster_num}",
+        f"{CLUSTER_NAME_PREFIX}-{cluster_num}",
         endpoint,
         "--install-disk",
         "/dev/vda",
@@ -1418,7 +1413,7 @@ def generate_talos_configuration(cluster_num: int, cp_ip: str):
 
     # Add registry mirrors if enabled
     if CONFIG.local_registries:
-        network_gateway = get_network_gateway(CONFIG)
+        network_gateway = get_network_gateway_ip_address(CONFIG)
         cmd.extend(
             [
                 "--registry-mirror",
@@ -1461,7 +1456,7 @@ def configure_talosctl_endpoints(cluster_num: int, cp_ips: list[str]):
         return
 
     step(f"Configuring talosctl for cluster {cluster_num}")
-    cfgdir = BASE_DIR / f"{CLUSTER_PREFIX}-{cluster_num}" / "configs"
+    cfgdir = BASE_DIR / f"{CLUSTER_NAME_PREFIX}-{cluster_num}" / "configs"
     talosconfig = cfgdir / "talosconfig"
 
     # Set TALOSCONFIG environment
@@ -1495,7 +1490,7 @@ def create_fresh_talosconfig(
     """Create a fresh talosconfig file from scratch."""
     warn(f"Creating fresh talosconfig for cluster {cluster_num}")
 
-    context_name = f"{CLUSTER_PREFIX}-{cluster_num}"
+    context_name = f"{CLUSTER_NAME_PREFIX}-{cluster_num}"
 
     # Create minimal talosconfig
     config_content = f"""context: {context_name}
@@ -1520,7 +1515,7 @@ contexts:
 
 
 def apply_node_configurations(cluster_num: int, cp_ips: list[str], worker_list: list):
-    cfgdir = BASE_DIR / f"{CLUSTER_PREFIX}-{cluster_num}" / "configs"
+    cfgdir = BASE_DIR / f"{CLUSTER_NAME_PREFIX}-{cluster_num}" / "configs"
 
     step(f"Cluster {cluster_num}: applying config (controlplanes)")
     for ip in cp_ips:
@@ -1587,14 +1582,14 @@ def create_vip_patch(vip_ip: str) -> str:
 def bootstrap_cluster(cluster_num: int, cp_ip: str):
     """Bootstrap Talos cluster and get kubeconfig."""
     step(f"Cluster {cluster_num}: bootstrap + kubeconfig")
-    cfgdir = BASE_DIR / f"{CLUSTER_PREFIX}-{cluster_num}" / "configs"
+    cfgdir = BASE_DIR / f"{CLUSTER_NAME_PREFIX}-{cluster_num}" / "configs"
 
     talosconfig = cfgdir / "talosconfig"
     env = os.environ.copy()
     env["TALOSCONFIG"] = str(talosconfig)
 
     # Use the context we created
-    context_name = f"{CLUSTER_PREFIX}-{cluster_num}"
+    context_name = f"{CLUSTER_NAME_PREFIX}-{cluster_num}"
 
     # Switch to our context
     run_shell(["talosctl", "config", "context", context_name], env=env)
@@ -1610,9 +1605,9 @@ def bootstrap_cluster(cluster_num: int, cp_ip: str):
         sleep_time=10,
     )
 
-    kube_dir = Path(f"/home/{SUDO_USER}/.kube")
+    kube_dir = Path(f"/home/{USER}/.kube")
     kube_dir.mkdir(parents=True, exist_ok=True)
-    kubeconfig_path = kube_dir / CLUSTER_PREFIX
+    kubeconfig_path = kube_dir / CLUSTER_NAME_PREFIX
 
     env["KUBECONFIG"] = str(kubeconfig_path)
 
@@ -1624,8 +1619,8 @@ def bootstrap_cluster(cluster_num: int, cp_ip: str):
         sleep_time=10,
     )
 
-    shutil.chown(kube_dir, SUDO_USER, SUDO_USER)
-    shutil.chown(kubeconfig_path, SUDO_USER, SUDO_USER)
+    shutil.chown(kube_dir, USER, USER)
+    shutil.chown(kubeconfig_path, USER, USER)
 
     ok(f"Cluster {cluster_num} bootstrapped")
 
@@ -1675,14 +1670,14 @@ def print_creation_summary(cp_ips: dict, worker_ips: dict):
 def remove_kubeconfig():
     """Removing kubeconfig"""
     step("Remove kubeconfig")
-    kubeconfig = Path(f"/home/{SUDO_USER}/.kube/{CLUSTER_PREFIX}")
+    kubeconfig = Path(f"/home/{USER}/.kube/{CLUSTER_NAME_PREFIX}")
     kubeconfig.unlink(missing_ok=True)
 
 
 def down(force: bool = False, remove_all: bool = False) -> None:
     """Cleanup resources."""
     global CONFIG, BASE_DIR
-    setup_sudo_user()
+    setup_user()
     print_cleanup_warning(remove_all)
     if not confirm_cleanup(force):
         info("Cleanup cancelled")
@@ -1760,7 +1755,7 @@ def up() -> None:
     validate_vip_allocation()
     confirm_or_die()
     provision_infra()
-    cp_ips, worker_ips = provision_clusters()
+    cp_ips, worker_ips = create_and_setup_clusters()
     check_all_clusters_health(cp_ips)
     print_creation_summary(cp_ips, worker_ips)
 
@@ -1768,7 +1763,7 @@ def up() -> None:
 def prepare_up() -> None:
     global CONFIG
     require_sudo()
-    setup_sudo_user()
+    setup_user()
     CONFIG = load_config()
     setup_environment()
     setup_signal_handlers()
@@ -1794,10 +1789,6 @@ def provision_infra() -> None:
     if CONFIG.local_registries:
         start_caching_registries()
     recreate_network()
-
-
-def provision_clusters() -> tuple[dict, dict]:
-    return create_and_setup_clusters()
 
 
 def main():
