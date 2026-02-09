@@ -250,9 +250,48 @@ def get_dhcp_start(config_data):
 
 
 def get_dhcp_end(config_data):
+    """Update DHCP range to exclude all possible VIP addresses."""
     subnet = config_data.virtual_network.subnet
     o1, o2, o3, _ = subnet.split(".")
-    return f"{o1}.{o2}.{o3}.254"
+
+    if should_enable_vip():
+        # Reserve .240-.250 for VIPs, DHCP ends at .239
+        return f"{o1}.{o2}.{o3}.239"
+    else:
+        return f"{o1}.{o2}.{o3}.254"
+
+
+def get_cluster_vip(cluster_num: int) -> str:
+    """Calculate unique VIP address for a specific cluster."""
+    if not should_enable_vip():
+        return None
+
+    subnet = CONFIG.virtual_network.subnet
+    o1, o2, o3, _ = subnet.split(".")
+
+    # Assign VIPs starting from .250 downwards to avoid DHCP conflicts
+    # Cluster 1 gets .250, Cluster 2 gets .249, etc.
+    vip_octet = 250 - (cluster_num - 1)
+
+    if vip_octet < 240:  # Keep some buffer
+        die(f"Too many clusters for VIP allocation. VIP octet would be {vip_octet}")
+
+    return f"{o1}.{o2}.{o3}.{vip_octet}"
+
+
+def should_enable_vip() -> bool:
+    """Check if VIP should be enabled (only for multiple control planes)."""
+    return CONFIG.control_plane_nodes_per_cluster > 1
+
+
+def get_vip_ip(config_data):
+    """Calculate VIP address if enabled."""
+    if not should_enable_vip():
+        return None
+
+    subnet = config_data.virtual_network.subnet
+    o1, o2, o3, _ = subnet.split(".")
+    return f"{o1}.{o2}.{o3}.253"  # Last usable IP before .254
 
 
 def create_qemu_disk(size: int, disk_path: str):
@@ -293,6 +332,15 @@ def setup_environment():
 
     info(f"Base directory: {BASE_DIR}")
     info(f"User: {SUDO_USER}")
+    if should_enable_vip():
+        # Show VIP range instead of single VIP
+        subnet = CONFIG.virtual_network.subnet
+        o1, o2, o3, _ = subnet.split(".")
+        info(
+            f"VIP range: {o1}.{o2}.{o3}.{250 - (CONFIG.cluster_count - 1)}-{o1}.{o2}.{o3}.250"
+        )
+    else:
+        info("VIP: disabled (single control plane)")
 
 
 def signal_handler(signum, frame):
@@ -1153,11 +1201,71 @@ def setup_single_cluster(cluster_num: int) -> Tuple[list, list]:
     cp_list = get_control_plane_ips(cluster_num)
     worker_list = get_worker_ips(cluster_num)
 
-    generate_talos_configuration(cluster_num, cp_list[0])
+    # Get cluster-specific VIP
+    cluster_vip = get_cluster_vip(cluster_num)
+
+    # Log HA status
+    if cluster_vip and should_enable_vip():
+        ok(f"Cluster {cluster_num}: HA mode enabled with VIP {cluster_vip}")
+    else:
+        ok(f"Cluster {cluster_num}: Single node mode (no VIP)")
+
+    generate_talos_configuration(cluster_num, cp_list[0] if cp_list else "")
+
+    # Configure talosctl endpoints properly
+    if cp_list:
+        configure_talosctl_endpoints(cluster_num, cp_list)
+
     apply_node_configurations(cluster_num, cp_list, worker_list)
-    bootstrap_cluster(cluster_num, cp_list[0])
+    bootstrap_cluster(cluster_num, cp_list[0] if cp_list else "")
 
     return cp_list, worker_list
+
+
+def validate_vip_allocation():
+    """Validate that we have enough VIP addresses for all clusters."""
+    if not should_enable_vip():
+        return
+
+    # Check if we have enough VIPs in our reserved range
+    max_clusters_with_vip = 11  # .240 to .250 inclusive = 11 VIPs
+
+    if CONFIG.cluster_count > max_clusters_with_vip:
+        die(
+            f"Too many clusters ({CONFIG.cluster_count}) for VIP allocation. Maximum is {max_clusters_with_vip}."
+        )
+
+    # Show VIP allocation plan
+    subnet = CONFIG.virtual_network.subnet
+    o1, o2, o3, _ = subnet.split(".")
+
+    info("VIP Allocation Plan:")
+    for c in range(1, CONFIG.cluster_count + 1):
+        vip = get_cluster_vip(c)
+        info(f"  Cluster {c}: {vip}")
+
+
+def finalize_talosconfig_with_ips(talosconfig_path: Path, cp_ips: list[str]):
+    """Replace hostname placeholders with actual IPs in talosconfig."""
+    step("Finalizing talosconfig with actual IPs")
+
+    with open(talosconfig_path, "r") as f:
+        content = f.read()
+
+    # Replace cp-X-Y placeholders with actual IPs
+    for i, ip in enumerate(cp_ips):
+        placeholder = f"cp-{i + 1}" if len(cp_ips) == 1 else f"cp-{i + 1}"
+        content = content.replace(placeholder, ip)
+
+    # If we have placeholders like cp-1-1, cp-1-2, etc., handle them too
+    for i, ip in enumerate(cp_ips):
+        placeholder = f"cp-1-{i + 1}"  # Assuming cluster 1 for pattern
+        content = content.replace(placeholder, ip)
+
+    with open(talosconfig_path, "w") as f:
+        f.write(content)
+
+    ok(f"Talosconfig updated with IPs: {cp_ips}")
 
 
 def get_control_plane_ips(cluster_num: int) -> list:
@@ -1191,12 +1299,23 @@ def generate_talos_configuration(cluster_num: int, cp_ip: str):
     step(f"Cluster {cluster_num}: generating Talos config")
     cfgdir = BASE_DIR / f"{CLUSTER_PREFIX}-{cluster_num}" / "configs"
 
+    # Get cluster-specific VIP
+    cluster_vip = get_cluster_vip(cluster_num)
+
+    # Determine endpoint: cluster VIP if enabled, otherwise single node IP
+    if cluster_vip and should_enable_vip():
+        endpoint = f"https://{cluster_vip}:6443"
+        info(f"Using cluster VIP endpoint: {endpoint}")
+    else:
+        endpoint = f"https://{cp_ip}:6443"
+        info(f"Using single node endpoint: {endpoint}")
+
     cmd = [
         "talosctl",
         "gen",
         "config",
         f"{CLUSTER_PREFIX}-{cluster_num}",
-        f"https://{cp_ip}:6443",
+        endpoint,
         "--install-disk",
         "/dev/vda",
         "-o",
@@ -1219,8 +1338,91 @@ def generate_talos_configuration(cluster_num: int, cp_ip: str):
             ]
         )
 
-    run_shell(cmd)
-    ok(f"Config generated: {cfgdir}")
+    # Add VIP patch only for control plane configs if VIP is enabled
+    if cluster_vip and should_enable_vip():
+        vip_patch = create_vip_patch(cluster_vip)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(vip_patch)
+            vip_patch_file = f.name
+
+        cmd.extend(["--config-patch-control-plane", f"@{vip_patch_file}"])
+
+        try:
+            run_shell(cmd)
+            ok(f"Config generated with VIP {cluster_vip}: {cfgdir}")
+        finally:
+            Path(vip_patch_file).unlink(missing_ok=True)
+    else:
+        run_shell(cmd)
+        ok(f"Config generated: {cfgdir}")
+
+    # Note: We removed the update_talosconfig_with_endpoints call here
+    # We'll configure endpoints after we get the actual IPs
+
+
+def configure_talosctl_endpoints(cluster_num: int, cp_ips: list[str]):
+    """Configure talosctl endpoints properly."""
+    if not cp_ips:
+        warn(f"No control plane IPs for cluster {cluster_num}")
+        return
+
+    step(f"Configuring talosctl for cluster {cluster_num}")
+    cfgdir = BASE_DIR / f"{CLUSTER_PREFIX}-{cluster_num}" / "configs"
+    talosconfig = cfgdir / "talosconfig"
+
+    # Set TALOSCONFIG environment
+    env = os.environ.copy()
+    env["TALOSCONFIG"] = str(talosconfig)
+
+    # Get current context
+    result = run_shell(["talosctl", "config", "info"], env=env, check=False)
+    info(f"Current config info: {result.stdout}")
+
+    # Simple approach: just set endpoint and node
+    try:
+        # Set endpoint
+        endpoints_cmd = ["talosctl", "config", "endpoint"] + cp_ips
+        run_shell(endpoints_cmd, env=env)
+        ok(f"Set endpoints to: {cp_ips}")
+
+        # Set node
+        node_cmd = ["talosctl", "config", "node", cp_ips[0]]
+        run_shell(node_cmd, env=env)
+        ok(f"Set node to: {cp_ips[0]}")
+    except Exception as e:
+        error(f"Failed to configure talosctl: {e}")
+        # Try alternative: create a new config from scratch
+        create_fresh_talosconfig(cluster_num, cp_ips, talosconfig)
+
+
+def create_fresh_talosconfig(
+    cluster_num: int, cp_ips: list[str], talosconfig_path: Path
+):
+    """Create a fresh talosconfig file from scratch."""
+    warn(f"Creating fresh talosconfig for cluster {cluster_num}")
+
+    context_name = f"{CLUSTER_PREFIX}-{cluster_num}"
+
+    # Create minimal talosconfig
+    config_content = f"""context: {context_name}
+contexts:
+  {context_name}:
+    endpoints:
+"""
+
+    # Add endpoints
+    for ip in cp_ips:
+        config_content += f"      - {ip}\n"
+
+    config_content += f"""    nodes:
+      - {cp_ips[0]}
+"""
+
+    # Write the config
+    with open(talosconfig_path, "w") as f:
+        f.write(config_content)
+
+    ok(f"Created fresh talosconfig for {context_name}")
 
 
 def apply_node_configurations(cluster_num: int, cp_ips: list[str], worker_list: list):
@@ -1234,6 +1436,7 @@ def apply_node_configurations(cluster_num: int, cp_ips: list[str], worker_list: 
     step(f"Cluster {cluster_num}: applying config (workers)")
     for ip in worker_list:
         apply_worker_config_with_storage(cluster_num, ip, cfgdir)
+        ok(f"Worker configured: {ip}")
 
 
 def apply_worker_config_with_storage(cluster_num: int, worker_ip: str, cfgdir: Path):
@@ -1276,6 +1479,17 @@ def apply_worker_config_with_storage(cluster_num: int, worker_ip: str, cfgdir: P
         Path(patch_file).unlink(missing_ok=True)
 
 
+def create_vip_patch(vip_ip: str) -> str:
+    return f"""machine:
+  network:
+    interfaces:
+      - interface: enp1s0
+        dhcp: true
+        vip:
+          ip: {vip_ip}
+"""
+
+
 def bootstrap_cluster(cluster_num: int, cp_ip: str):
     """Bootstrap Talos cluster and get kubeconfig."""
     step(f"Cluster {cluster_num}: bootstrap + kubeconfig")
@@ -1285,14 +1499,19 @@ def bootstrap_cluster(cluster_num: int, cp_ip: str):
     env = os.environ.copy()
     env["TALOSCONFIG"] = str(talosconfig)
 
-    run_shell(["talosctl", "config", "endpoint", cp_ip], env=env)
-    run_shell(["talosctl", "config", "node", cp_ip], env=env)
+    # Use the context we created
+    context_name = f"{CLUSTER_PREFIX}-{cluster_num}"
+
+    # Switch to our context
+    run_shell(["talosctl", "config", "context", context_name], env=env)
 
     if not wait_for_port(cp_ip, 50000, 300):
         die(f"Talos API never opened on {cp_ip}")
 
     retry(
-        lambda: run_shell(["talosctl", "-n", cp_ip, "bootstrap"], env=env),
+        lambda: run_shell(
+            ["talosctl", "--context", context_name, "bootstrap"], env=env
+        ),
         max_retries=30,
         sleep_time=10,
     )
@@ -1301,11 +1520,12 @@ def bootstrap_cluster(cluster_num: int, cp_ip: str):
     kube_dir.mkdir(parents=True, exist_ok=True)
     kubeconfig_path = kube_dir / CLUSTER_PREFIX
 
-    # Either:
     env["KUBECONFIG"] = str(kubeconfig_path)
 
     retry(
-        lambda: run_shell(["talosctl", "-n", cp_ip, "kubeconfig"], env=env),
+        lambda: run_shell(
+            ["talosctl", "--context", context_name, "kubeconfig"], env=env
+        ),
         max_retries=30,
         sleep_time=10,
     )
@@ -1323,20 +1543,39 @@ def check_all_clusters_health(cp_ips: dict):
 
 
 def print_creation_summary(cp_ips: dict, worker_ips: dict):
-    """Print final creation summary."""
+    """Print final creation summary with per-cluster VIP info."""
     print()
     ok("CREATION COMPLETE")
     info(f"Network: {CONFIG.virtual_network.name}")
     info(f"Base dir: {BASE_DIR}")
-    print("=== Cluster IPs ===")
+
+    if should_enable_vip():
+        subnet = CONFIG.virtual_network.subnet
+        o1, o2, o3, _ = subnet.split(".")
+        info(f"VIP range reserved: {o1}.{o2}.{o3}.240-{o1}.{o2}.{o3}.250")
+
+    print("=== Cluster Details ===")
 
     for c in range(1, CONFIG.cluster_count + 1):
-        print(f"Cluster {c}:")
+        cluster_vip = get_cluster_vip(c)
+        print(f"\nCluster {c}:")
+
+        if cluster_vip and should_enable_vip():
+            print(f"  VIP:           {cluster_vip}")
+
         if c in cp_ips:
             for i, cp_ip in enumerate(cp_ips[c]):
                 print(f"  Control plane {i + 1}: {cp_ip}")
+
         if c in worker_ips:
             print(f"  Workers:       {' '.join(worker_ips[c])}")
+
+        if should_enable_vip():
+            print(
+                f"  HA Mode:       Enabled ({CONFIG.control_plane_nodes_per_cluster} control planes)"
+            )
+        else:
+            print(f"  HA Mode:       Disabled (single control plane)")
 
 
 def remove_kubeconfig():
@@ -1418,6 +1657,7 @@ def up():
 
     setup_permissions()
     check_resources()
+    validate_vip_allocation()
 
     if not confirm_proceed():
         die("Cancelled")
