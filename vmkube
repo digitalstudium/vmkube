@@ -15,6 +15,7 @@ import tomllib
 
 # constants
 NETWORK_NETMASK = "255.255.248.0"
+CLUSTER_PREFIX = "vmkube"
 ISO_NAME = "metal-amd64.iso"
 ISO_URL = f"https://github.com/siderolabs/talos/releases/latest/download/{ISO_NAME}"
 
@@ -320,7 +321,7 @@ def cleanup_data_directories():
 
     # Remove cluster directories
     if BASE_DIR.exists():
-        for item in BASE_DIR.glob("cluster-*"):
+        for item in BASE_DIR.glob(f"{CLUSTER_PREFIX}-*"):
             if item.is_dir():
                 info(f"  Removing directory: {item}")
                 shutil.rmtree(item, ignore_errors=True)
@@ -334,7 +335,7 @@ def cleanup_all_vms_by_pattern():
     patterns = ["cp-", "worker-"]
 
     # Get list of all VMs
-    result = run_shell(["virsh", "list", "--all"], capture_output=True, check=False)
+    result = run_shell(["virsh", "list", "--all"], check=False)
     if result.returncode == 0:
         for line in result.stdout.splitlines()[2:]:  # Skip header
             if line.strip():
@@ -791,7 +792,7 @@ def create_vm_with_virt_install(
 
 def get_cluster_directory(cluster_num: int) -> Path:
     """Get the directory path for a specific cluster."""
-    return BASE_DIR / f"cluster-{cluster_num}"
+    return BASE_DIR / f"{CLUSTER_PREFIX}-{cluster_num}"
 
 
 def prepare_control_plane_disk(cluster_num: int, cp_num: int) -> Path:
@@ -901,15 +902,26 @@ def check_cluster_health(cluster_num: int, cp_ips: list):
     """Check cluster health using first control plane node."""
     primary_cp_ip = cp_ips[0]
 
-    step(f"Checking health of cluster-{cluster_num} (control plane: {primary_cp_ip})")
+    step(
+        f"Checking health of {CLUSTER_PREFIX}-{cluster_num} (control plane: {primary_cp_ip})"
+    )
 
-    config_file = BASE_DIR / f"cluster-{cluster_num}" / "configs" / "talosconfig"
+    config_file = (
+        BASE_DIR / f"{CLUSTER_PREFIX}-{cluster_num}" / "configs" / "talosconfig"
+    )
 
     env = os.environ.copy()
     env["TALOSCONFIG"] = str(config_file)
 
     run_shell(
-        ["talosctl", "health", "-c", f"cluster-{cluster_num}", "-n", primary_cp_ip],
+        [
+            "talosctl",
+            "health",
+            "-c",
+            f"{CLUSTER_PREFIX}-{cluster_num}",
+            "-n",
+            primary_cp_ip,
+        ],
         env=env,
     )
 
@@ -1042,7 +1054,7 @@ def create_and_setup_clusters() -> Tuple[dict, dict]:
 def setup_cluster_directory(cluster_num: int):
     """Setup directory structure for a cluster."""
     step(f"Cluster {cluster_num}: directories")
-    cluster_dir = BASE_DIR / f"cluster-{cluster_num}"
+    cluster_dir = BASE_DIR / f"{CLUSTER_PREFIX}-{cluster_num}"
     config_dir = cluster_dir / "configs"
 
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -1060,7 +1072,7 @@ def setup_single_cluster(cluster_num: int) -> Tuple[list, list]:
     worker_list = get_worker_ips(cluster_num)
 
     generate_talos_configuration(cluster_num, cp_list[0])
-    apply_node_configurations(cluster_num, cp_list[0], worker_list)
+    apply_node_configurations(cluster_num, cp_list, worker_list)
     bootstrap_cluster(cluster_num, cp_list[0])
 
     return cp_list, worker_list
@@ -1095,14 +1107,14 @@ def get_worker_ips(cluster_num: int) -> list:
 def generate_talos_configuration(cluster_num: int, cp_ip: str):
     """Generate Talos configuration files."""
     step(f"Cluster {cluster_num}: generating Talos config")
-    cfgdir = BASE_DIR / f"cluster-{cluster_num}" / "configs"
+    cfgdir = BASE_DIR / f"{CLUSTER_PREFIX}-{cluster_num}" / "configs"
 
     run_shell(
         [
             "talosctl",
             "gen",
             "config",
-            f"cluster-{cluster_num}",
+            f"{CLUSTER_PREFIX}-{cluster_num}",
             f"https://{cp_ip}:6443",
             "--install-disk",
             "/dev/vda",
@@ -1114,13 +1126,13 @@ def generate_talos_configuration(cluster_num: int, cp_ip: str):
     ok(f"Config generated: {cfgdir}")
 
 
-def apply_node_configurations(cluster_num: int, cp_ip: str, worker_list: list):
-    """Apply configurations to all nodes."""
-    cfgdir = BASE_DIR / f"cluster-{cluster_num}" / "configs"
+def apply_node_configurations(cluster_num: int, cp_ips: list[str], worker_list: list):
+    cfgdir = BASE_DIR / f"{CLUSTER_PREFIX}-{cluster_num}" / "configs"
 
-    step(f"Cluster {cluster_num}: applying config (controlplane)")
-    apply_config(cp_ip, cfgdir / "controlplane.yaml")
-    ok("Controlplane configured")
+    step(f"Cluster {cluster_num}: applying config (controlplanes)")
+    for ip in cp_ips:
+        apply_config(ip, cfgdir / "controlplane.yaml")
+        ok(f"Controlplane configured: {ip}")
 
     step(f"Cluster {cluster_num}: applying config (workers)")
     for ip in worker_list:
@@ -1170,7 +1182,7 @@ def apply_worker_config_with_storage(cluster_num: int, worker_ip: str, cfgdir: P
 def bootstrap_cluster(cluster_num: int, cp_ip: str):
     """Bootstrap Talos cluster and get kubeconfig."""
     step(f"Cluster {cluster_num}: bootstrap + kubeconfig")
-    cfgdir = BASE_DIR / f"cluster-{cluster_num}" / "configs"
+    cfgdir = BASE_DIR / f"{CLUSTER_PREFIX}-{cluster_num}" / "configs"
 
     talosconfig = cfgdir / "talosconfig"
     env = os.environ.copy()
@@ -1188,13 +1200,23 @@ def bootstrap_cluster(cluster_num: int, cp_ip: str):
         sleep_time=10,
     )
 
-    ok(f"Cluster {cluster_num} bootstrapped")
+    kube_dir = Path(f"/home/{SUDO_USER}/.kube")
+    kube_dir.mkdir(parents=True, exist_ok=True)
+    kubeconfig_path = kube_dir / CLUSTER_PREFIX
+
+    # Either:
+    env["KUBECONFIG"] = str(kubeconfig_path)
 
     retry(
         lambda: run_shell(["talosctl", "-n", cp_ip, "kubeconfig"], env=env),
         max_retries=30,
         sleep_time=10,
     )
+
+    shutil.chown(kube_dir, SUDO_USER, SUDO_USER)
+    shutil.chown(kubeconfig_path, SUDO_USER, SUDO_USER)
+
+    ok(f"Cluster {cluster_num} bootstrapped")
 
 
 def check_all_clusters_health(cp_ips: dict):
@@ -1220,6 +1242,13 @@ def print_creation_summary(cp_ips: dict, worker_ips: dict):
             print(f"  Workers:       {' '.join(worker_ips[c])}")
 
 
+def remove_kubeconfig():
+    """Removing kubeconfig"""
+    step("Remove kubeconfig")
+    kubeconfig = Path(f"/home/{SUDO_USER}/.kube/{CLUSTER_PREFIX}")
+    kubeconfig.unlink(missing_ok=True)
+
+
 def down(force: bool = False):
     """Cleanup resources."""
     global CONFIG, BASE_DIR
@@ -1243,6 +1272,7 @@ def down(force: bool = False):
     existing_vms = get_all_vm_names()
 
     if CONFIG is not None:
+        remove_kubeconfig()
         cleanup_control_plane_nodes(existing_vms)
         cleanup_worker_nodes(existing_vms)
         remove_virtual_network()

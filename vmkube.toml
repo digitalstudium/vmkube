@@ -2,6 +2,7 @@ base_dir = "/var/lib/vmkube"
 cluster_count = 2  # сколько кластеров?
 worker_nodes_per_cluster = 2  # сколько воркер-нод на каждый кластер?
 control_plane_nodes_per_cluster = 3  # сколько control-plane-нод на каждый кластер?
+local_registries = True  # создаёт локальные docker registry, проксирующие на docker hub и т. п.
 
 # Внимание! По памяти и по CPU возможен overcommit, по диску - нет.
 [control_plane_node]

@@ -1,13 +1,13 @@
 # vmkube
 
-Create and destroy virtual machines backed Kubernetes clusters on your laptop with a single command.
+Create virtual machines backed Kubernetes clusters on your laptop with a single command.
 
 **One command to create clusters:** `sudo vmkube up`  
 **One command to destroy clusters:** `sudo vmkube down`
 
 ## How it works
 
-vmkube creates Kubernetes clusters using KVM virtual machines. It handles everything automatically:
+`vmkube` creates Kubernetes clusters using KVM virtual machines. It handles everything automatically:
 
 1. Creates virtual machines for control plane and worker nodes
 2. Sets up isolated networking
@@ -37,7 +37,7 @@ sudo apt install -y vmkube
 
 pick `vmkube.toml` from this repository, modify it if necessary and place it here: `~/.config/vmkube.toml`
 
-### Create your first cluster
+### Create clusters
 
 ```bash
 sudo vmkube up
