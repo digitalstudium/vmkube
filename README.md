@@ -64,6 +64,7 @@ After creation, access Kubernetes with:
 ```bash
 export KUBECONFIG=~/.kube/vmkube
 kubectl config get-contexts
+kubectl config use-context admin@vmkube-1
 kubectl get nodes
 ```
 
