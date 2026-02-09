@@ -154,27 +154,28 @@ def initconfig(force: bool = False):
     config_dir = config_path.parent
 
     default_toml = """\
-base_dir = "/var/lib/vmkube"
-cluster_count = 1
-worker_nodes_per_cluster = 1
-control_plane_nodes_per_cluster = 1
-local_registries = false
+base_dir = "/var/lib/vmkube"  # Base directory for VMKube files and virtual machines
+cluster_count = 1  # Number of Kubernetes clusters to create
+worker_nodes_per_cluster = 1  # Number of worker nodes per cluster
+control_plane_nodes_per_cluster = 1  # Number of control plane nodes per cluster
+local_registries = false  # Create local docker registries that proxy to Docker Hub
 
+# Warning! Overcommit is possible for memory and CPU, but not for disk.
 [control_plane_node]
-cpus = 2
-ram = 2048
-system_disk = 10
+cpus = 2  # Number of CPU cores for each control plane node
+ram = 2048  # RAM in MB for each control plane node
+system_disk = 10  # Disk space in GB for system, Docker images, and ephemeral storage
 
 [worker_node]
-cpus = 2
-ram = 4096
-system_disk = 15
-storage_disk = 10
+cpus = 2  # Number of CPU cores for each worker node
+ram = 4096  # RAM in MB for each worker node
+system_disk = 15  # Disk space in GB for system, Docker images, and ephemeral storage
+storage_disk = 10  # Disk space in GB for Persistent Volume Claims (PVC)
 
 [virtual_network]
-name = "vmkube-network"
-bridge = "vmkube-br0"
-subnet = "192.168.192.0"
+name = "vmkube-network"  # Name of the virtual network for the virtual machines
+bridge = "vmkube-br0"  # Name of the virtual bridge interface for host-VM communication
+subnet = "192.168.192.0"  # Network will use /21 mask (third octet will be 192-199). IPs for VMs and load balancers will be allocated from this subnet
 """
 
     config_dir.mkdir(parents=True, exist_ok=True)

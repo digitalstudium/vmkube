@@ -24,7 +24,8 @@ sudo apt install -y \
   libvirt-daemon-system libvirt-clients \
   virtinst \
   systemd-timesyncd \
-  curl
+  curl \
+  docker.io
 
 sudo systemctl enable --now libvirtd
 ```
