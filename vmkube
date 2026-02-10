@@ -24,6 +24,7 @@ REGISTRIES_PORTS: list[tuple[str, int]] = [
     ("registry.k8s.io", 5001),
     ("gcr.io", 5003),
     ("ghcr.io", 5004),
+    ("mirror.gcr.io", 5005),
 ]
 
 DEFAULT_CONFIG_TOML = """\
@@ -213,9 +214,7 @@ def chown_config_if_sudo(config_path: Path, username: str) -> None:
 
 # local registries
 def start_caching_registries() -> None:
-    """Start pull-through caching registries if enabled in config."""
-    if not CONFIG.local_registries:
-        return
+    """Start pull-through caching registries"""
     step("Starting pull-through image cache registries")
     for remote, port in REGISTRIES_PORTS:
         ensure_registry_running(remote, port)
@@ -223,9 +222,7 @@ def start_caching_registries() -> None:
 
 
 def remove_caching_registries() -> None:
-    """Remove pull-through caching registries if enabled."""
-    if not CONFIG.local_registries:
-        return
+    """Remove pull-through caching registries"""
     step("Removing pull-through image cache registries")
     for remote, _ in REGISTRIES_PORTS:
         remove_registry_container(remote)
@@ -272,16 +269,26 @@ def registry_run_cmd(name: str, remote: str, port: int) -> list[str]:
         "always",
         "--name",
         name,
-        "registry:2",
+        "registry:3",
     ]
 
 
 def run_shell(
-    cmd: list[str], check: bool = True, verbose: bool = False, **kwargs
-) -> subprocess.CompletedProcess:
-    """Run command and return CompletedProcess (or CalledProcessError if check=False)."""
+    cmd: list[str],
+    check: bool = True,
+    verbose: bool = False,
+    capture: bool = True,
+    **kwargs,
+):
     try:
-        result = _subprocess_run(cmd, check=check, **kwargs)
+        if capture:
+            result = subprocess.run(
+                cmd, check=check, capture_output=True, text=True, **kwargs
+            )
+        else:
+            # inherit stdout/stderr so curl can render the progress bar
+            result = subprocess.run(cmd, check=check, text=True, **kwargs)
+
         _log_verbose(cmd, result, verbose)
         return result
     except subprocess.CalledProcessError as e:
@@ -289,12 +296,6 @@ def run_shell(
         if check:
             raise
         return e
-
-
-def _subprocess_run(
-    cmd: list[str], check: bool, **kwargs
-) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, check=check, capture_output=True, text=True, **kwargs)
 
 
 def _log_verbose(
@@ -1113,6 +1114,7 @@ def check_cluster_health(cluster_num: int, cp_ips: list):
             primary_cp_ip,
         ],
         env=env,
+        capture=False,
     )
 
 
@@ -1201,7 +1203,8 @@ def download_talos_iso():
     if not iso_path.exists():
         info(f"Downloading {ISO_URL}")
         run_shell(
-            ["curl", "--fail", "--progress-bar", "-L", ISO_URL, "-o", str(iso_path)]
+            ["curl", "--fail", "--progress-bar", "-L", ISO_URL, "-o", str(iso_path)],
+            capture=False,
         )
         ok(f"ISO downloaded: {iso_path}")
     else:
@@ -1424,6 +1427,8 @@ def generate_talos_configuration(cluster_num: int, cp_ip: str):
                 f"gcr.io=http://{network_gateway}:5003",
                 "--registry-mirror",
                 f"ghcr.io=http://{network_gateway}:5004",
+                "--registry-mirror",
+                f"mirror.gcr.io=http://{network_gateway}:5005",
             ]
         )
 
@@ -1444,9 +1449,6 @@ def generate_talos_configuration(cluster_num: int, cp_ip: str):
     else:
         run_shell(cmd)
         ok(f"Config generated: {cfgdir}")
-
-    # Note: We removed the update_talosconfig_with_endpoints call here
-    # We'll configure endpoints after we get the actual IPs
 
 
 def configure_talosctl_endpoints(cluster_num: int, cp_ips: list[str]):
@@ -1643,7 +1645,7 @@ def print_creation_summary(cp_ips: dict, worker_ips: dict):
         o1, o2, o3, _ = subnet.split(".")
         info(f"VIP range reserved: {o1}.{o2}.{o3}.240-{o1}.{o2}.{o3}.250")
 
-    print("=== Cluster Details ===")
+    print("=== Clusters Details ===")
 
     for c in range(1, CONFIG.cluster_count + 1):
         cluster_vip = get_cluster_vip(c)
@@ -1657,14 +1659,15 @@ def print_creation_summary(cp_ips: dict, worker_ips: dict):
                 print(f"  Control plane {i + 1}: {cp_ip}")
 
         if c in worker_ips:
-            print(f"  Workers:       {' '.join(worker_ips[c])}")
+            print(f"  Workers:         {' '.join(worker_ips[c])}")
 
         if should_enable_vip():
             print(
-                f"  HA Mode:       Enabled ({CONFIG.control_plane_nodes_per_cluster} control planes)"
+                f"  HA Mode:         Enabled ({CONFIG.control_plane_nodes_per_cluster} control planes)"
             )
         else:
-            print(f"  HA Mode:       Disabled (single control plane)")
+            print("  HA Mode:         Disabled (single control plane)")
+        print(f"  kubeconfig path:         {get_user_home(get_user())}/.kube/vmkube")
 
 
 def remove_kubeconfig():

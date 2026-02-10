@@ -7,7 +7,7 @@ Create virtual machines backed Kubernetes clusters on your laptop with a single 
 
 ## Description
 
-`vmkube` uses `virsh` and `talosctl` under the hood. It creates virtual machines for control plane and worker nodes, sets up isolated networking, installs Talos Linux on each VM, bootstraps Kubernetes clusters, and provides kubeconfig for immediate access. When you're done, one command removes all VMs, networks, and disks.
+`vmkube` uses `virt-install` and `talosctl` under the hood. It creates virtual machines for control plane and worker nodes, sets up isolated networking, installs Talos Linux on each VM, bootstraps Kubernetes clusters, and provides kubeconfig for immediate access. When you're done, one command removes all VMs, networks, and disks.
 
 It was tested on Linux, specifically debian-based distributions. It could work on other Linux distributions as well.
 
@@ -16,7 +16,7 @@ It was tested on Linux, specifically debian-based distributions. It could work o
 ### Install requirements
 
 apt packages:
-
+2
 ```bash
 sudo apt update
 sudo apt install -y \
