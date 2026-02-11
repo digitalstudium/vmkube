@@ -19,20 +19,21 @@ NETWORK_MASK = "255.255.248.0"
 CLUSTER_NAME_PREFIX = "vmkube"
 ISO_NAME = "metal-amd64.iso"
 ISO_URL = f"https://github.com/siderolabs/talos/releases/latest/download/{ISO_NAME}"
-REGISTRIES_PORTS: list[tuple[str, int]] = [
-    ("docker.io", 5000),
-    ("registry.k8s.io", 5001),
-    ("gcr.io", 5003),
-    ("ghcr.io", 5004),
-    ("mirror.gcr.io", 5005),
-]
 
 DEFAULT_CONFIG_TOML = """\
 base_dir = "/var/lib/vmkube"  # Base directory for VMKube files and virtual machines
 cluster_count = 1  # Number of Kubernetes clusters to create
 worker_nodes_per_cluster = 1  # Number of worker nodes per cluster
 control_plane_nodes_per_cluster = 1  # Number of control plane nodes per cluster
-local_registries = false  # Create local docker registries that proxy to Docker Hub
+
+# registries will be available at {network_gateway}:{port}
+registries = [
+    { remote = "docker.io", port = 5000 },
+    { remote = "registry.k8s.io", port = 5001 },
+    { remote = "gcr.io", port = 5003 },
+    { remote = "ghcr.io", port = 5004 },
+    { remote = "registry-1.docker.io", port = 5005 },
+]
 
 # Warning! Overcommit is possible for memory and CPU, but not for disk.
 [control_plane_node]
@@ -47,7 +48,7 @@ system_disk = 15  # Disk space in GB for system, Docker images, and ephemeral st
 storage_disk = 10  # Disk space in GB for Persistent Volume Claims (PVC)
 
 [virtual_network]
-name = "vmkube-network"  # Name of the virtual network for the virtual machines
+name = "vmkube-net"  # Name of the virtual network for the virtual machines
 bridge = "vmkube-br0"  # Name of the virtual bridge interface for host-VM communication
 subnet = "192.168.192.0"  # Network will use /21 mask (third octet will be 192-199). IPs for VMs and load balancers will be allocated from this subnet
 """
@@ -97,7 +98,13 @@ def die(msg: str):
     sys.exit(1)
 
 
-# config
+# config - dataclasses
+@dataclass
+class RegistryEntry:
+    remote: str
+    port: int
+
+
 @dataclass
 class ControlPlaneNode:
     cpus: int
@@ -129,7 +136,7 @@ class Config:
     control_plane_node: ControlPlaneNode
     worker_node: WorkerNode
     virtual_network: VirtualNetwork
-    local_registries: bool = False
+    registries: Optional[List[RegistryEntry]] = None
 
 
 def get_user() -> str:
@@ -168,7 +175,7 @@ def read_toml(path: Path) -> dict:
 
 
 def build_config(data: dict) -> Config:
-    return Config(
+    config = Config(
         base_dir=os.path.expanduser(data["base_dir"]),
         cluster_count=data["cluster_count"],
         worker_nodes_per_cluster=data["worker_nodes_per_cluster"],
@@ -176,8 +183,12 @@ def build_config(data: dict) -> Config:
         control_plane_node=ControlPlaneNode(**data["control_plane_node"]),
         worker_node=WorkerNode(**data["worker_node"]),
         virtual_network=VirtualNetwork(**data["virtual_network"]),
-        local_registries=data.get("local_registries", False),
     )
+    if "registries" in data:
+        config.registries = [RegistryEntry(**r) for r in data["registries"]]
+    else:
+        config.registries = []
+    return config
 
 
 def initconfig(force: bool = False) -> None:
@@ -216,16 +227,16 @@ def chown_config_if_sudo(config_path: Path, username: str) -> None:
 def start_caching_registries() -> None:
     """Start pull-through caching registries"""
     step("Starting pull-through image cache registries")
-    for remote, port in REGISTRIES_PORTS:
-        ensure_registry_running(remote, port)
+    for reg in CONFIG.registries:
+        ensure_registry_running(reg.remote, reg.port)
     ok("Caching registries started")
 
 
 def remove_caching_registries() -> None:
     """Remove pull-through caching registries"""
     step("Removing pull-through image cache registries")
-    for remote, _ in REGISTRIES_PORTS:
-        remove_registry_container(remote)
+    for reg in CONFIG.registries:
+        remove_registry_container(reg.remote)
     ok("Caching registries removed")
 
 
@@ -538,14 +549,12 @@ def cleanup_all_vms_by_pattern():
 
 def remove_network_by_default_name():
     """Remove network by common default names."""
-    default_networks = ["talos-network", "taloslab", "kube-net"]
-
-    for net_name in default_networks:
-        result = run_shell(["virsh", "net-info", net_name], check=False)
-        if result.returncode == 0:
-            info(f"Removing network: {net_name}")
-            run_shell(["virsh", "net-destroy", net_name], check=False)
-            run_shell(["virsh", "net-undefine", net_name], check=False)
+    default_network_name = "vmkube-net"
+    result = run_shell(["virsh", "net-info", default_network_name], check=False)
+    if result.returncode == 0:
+        info(f"Removing network: {default_network_name}")
+        run_shell(["virsh", "net-destroy", default_network_name], check=False)
+        run_shell(["virsh", "net-undefine", default_network_name], check=False)
 
 
 def setup_permissions():
@@ -1415,22 +1424,15 @@ def generate_talos_configuration(cluster_num: int, cp_ip: str):
     ]
 
     # Add registry mirrors if enabled
-    if CONFIG.local_registries:
+    if CONFIG.registries:
         network_gateway = get_network_gateway_ip_address(CONFIG)
-        cmd.extend(
-            [
-                "--registry-mirror",
-                f"docker.io=http://{network_gateway}:5000",
-                "--registry-mirror",
-                f"registry.k8s.io=http://{network_gateway}:5001",
-                "--registry-mirror",
-                f"gcr.io=http://{network_gateway}:5003",
-                "--registry-mirror",
-                f"ghcr.io=http://{network_gateway}:5004",
-                "--registry-mirror",
-                f"mirror.gcr.io=http://{network_gateway}:5005",
-            ]
-        )
+        for reg in CONFIG.registries:
+            cmd.extend(
+                [
+                    "--registry-mirror",
+                    f"{reg.remote}=http://{network_gateway}:{reg.port}",
+                ]
+            )
 
     # Add VIP patch only for control plane configs if VIP is enabled
     if cluster_vip and should_enable_vip():
@@ -1721,7 +1723,7 @@ def cleanup_with_config(existing_vms: set[str], remove_all: bool) -> None:
     cleanup_control_plane_nodes(existing_vms)
     cleanup_worker_nodes(existing_vms)
     remove_virtual_network()
-    if remove_all and CONFIG.local_registries:
+    if remove_all and CONFIG.registries:
         remove_caching_registries()
 
 
@@ -1729,7 +1731,7 @@ def cleanup_without_config(remove_all: bool) -> None:
     cleanup_all_vms_by_pattern()
     remove_network_by_default_name()
     if remove_all:
-        remove_caching_registries()
+        warn("Registry removal skipped – no configuration file found.")
 
 
 def cleanup_data_if_present() -> None:
@@ -1773,7 +1775,7 @@ def prepare_up() -> None:
 
 
 def ensure_local_registry_prereqs() -> None:
-    if not CONFIG.local_registries:
+    if not CONFIG.registries:
         return
     if shutil.which("docker") is None:
         die("Docker is required for local registries but not found")
@@ -1789,7 +1791,7 @@ def provision_infra() -> None:
     ensure_time_sync()
     setup_working_directory()
     download_talos_iso()
-    if CONFIG.local_registries:
+    if CONFIG.registries:
         start_caching_registries()
     recreate_network()
 
