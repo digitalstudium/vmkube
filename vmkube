@@ -35,6 +35,7 @@ registries = [
     { remote = "registry-1.docker.io", port = 5004 },
     { remote = "mirror.gcr.io", port = 5005 },
     { remote = "public.ecr.aws", port = 5006 },
+    { remote = "quay.io", port = 5007 },
 ]
 
 # Warning! Overcommit is possible for memory and CPU, but not for disk.
