@@ -13,10 +13,10 @@ It was tested on Linux, specifically debian-based distributions. It could work o
 
 ## Quick start
 
-### Install requirements
+### Install dependencies
 
-apt packages:
-2
+#### apt packages
+
 ```bash
 sudo apt update
 sudo apt install -y \
@@ -30,7 +30,7 @@ sudo apt install -y \
 sudo systemctl enable --now libvirtd
 ```
 
-talosctl:
+#### talosctl
 
 ```bash
 curl -sL https://talos.dev/install | sh
@@ -42,8 +42,7 @@ curl -sL https://talos.dev/install | sh
 curl -OL "https://raw.githubusercontent.com/digitalstudium/vmkube/refs/heads/main/vmkube" && sudo install ./vmkube /usr/local/bin/vmkube && rm -f ./vmkube
 ```
 
-### Create config
-
+### Create cconfig
 ```bash
 vmkube initconfig
 ```
@@ -74,4 +73,4 @@ kubectl get nodes
 sudo vmkube down
 ```
 
-## That's it
+PRs and issues are welcomed! 
