@@ -34,8 +34,7 @@ registries = [
     { remote = "ghcr.io", port = 5003 },
     { remote = "registry-1.docker.io", port = 5004 },
     { remote = "mirror.gcr.io", port = 5005 },
-    { remote = "public.ecr.aws", port = 5006 },
-    { remote = "quay.io", port = 5007 },
+    { remote = "quay.io", port = 5006 },
 ]
 
 # Warning! Overcommit is possible for memory and CPU, but not for disk.
@@ -1455,6 +1454,44 @@ def generate_talos_configuration(cluster_num: int, cp_ip: str):
         run_shell(cmd)
         ok(f"Config generated: {cfgdir}")
 
+    common_patch = """machine:
+  kubelet:
+    extraArgs:
+      rotate-server-certificates: true
+cluster:
+  extraManifests:
+    - https://raw.githubusercontent.com/alex1989hu/kubelet-serving-cert-approver/main/deploy/standalone-install.yaml
+    - https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+  controllerManager:
+    extraArgs:
+      bind-address: "0.0.0.0"
+  scheduler:
+    extraArgs:
+      bind-address: "0.0.0.0"
+    """
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        f.write(common_patch)
+        common_patch_file = f.name
+
+    # Apply the patch to controlplane.yaml, producing controlplane-patched.yaml
+    patched_controlplane = cfgdir / "controlplane-patched.yaml"
+    run_shell(
+        [
+            "talosctl",
+            "machineconfig",
+            "patch",
+            str(cfgdir / "controlplane.yaml"),
+            "--patch",
+            f"@{common_patch_file}",
+            "-o",
+            str(patched_controlplane),
+        ]
+    )
+    # Clean up the temporary patch file
+    Path(common_patch_file).unlink(missing_ok=True)
+
+    info(f"Patched control plane config created: {patched_controlplane}")
+
 
 def configure_talosctl_endpoints(cluster_num: int, cp_ips: list[str]):
     """Configure talosctl endpoints properly."""
@@ -1525,8 +1562,9 @@ def apply_node_configurations(cluster_num: int, cp_ips: list[str], worker_list: 
     cfgdir = BASE_DIR / f"{CLUSTER_NAME_PREFIX}-{cluster_num}" / "configs"
 
     step(f"Cluster {cluster_num}: applying config (controlplanes)")
+    patched_controlplane = cfgdir / "controlplane-patched.yaml"
     for ip in cp_ips:
-        apply_config(ip, cfgdir / "controlplane.yaml")
+        apply_config(ip, patched_controlplane)
         ok(f"Controlplane configured: {ip}")
 
     step(f"Cluster {cluster_num}: applying config (workers)")
@@ -1537,19 +1575,17 @@ def apply_node_configurations(cluster_num: int, cp_ips: list[str], worker_list: 
 
 def apply_worker_config_with_storage(cluster_num: int, worker_ip: str, cfgdir: Path):
     """Apply storage configuration to worker node."""
-    step(f"Cluster {cluster_num}: adding storage to worker config of {worker_ip}")
+    step(f"Cluster {cluster_num}: adding patch to worker config of {worker_ip}")
 
     patch_yaml = """machine:
   disks:
     - device: /dev/vdb
       partitions:
         - mountpoint: /var/mnt/local-path-provisioner
-  files:
-    - path: /etc/cri/conf.d/20-customization.part
-      op: create
-      content: |
-        [plugins."io.containerd.cri.v1.images"]
-          discard_unpacked_layers = false
+# needed for metrics server
+  kubelet:
+    extraArgs:
+      rotate-server-certificates: true
 """
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
