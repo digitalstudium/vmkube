@@ -741,7 +741,11 @@ def create_network_xml():
     <nat><port start="1024" end="65535"/></nat>
   </forward>
   <ip address="{NETWORK_GATEWAY}" netmask="{NETWORK_MASK}">
-    <dhcp><range start="{DHCP_START}" end="{DHCP_END}"/></dhcp>
+    <dhcp>
+        <range start="{DHCP_START}" end="{DHCP_END}">
+            <lease expiry='0'/>
+        </range>
+    </dhcp>
   </ip>
 </network>"""
     return network_xml
