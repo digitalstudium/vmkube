@@ -1144,7 +1144,7 @@ def wait_for_port(ip: str, port: int, timeout: int = 120):
                 info(f"Port {port} is open on {ip}")
                 return True
 
-            info(f"Waiting for {ip}:{port} ({i * 5}/{timeout})")
+            info(f"Waiting for {ip}:{port} ({i * 5}s/{timeout}s)")
         except:
             pass
 
