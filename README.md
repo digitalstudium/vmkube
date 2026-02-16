@@ -26,7 +26,11 @@ sudo apt install -y \
   systemd-timesyncd \
   curl \
   docker.io
+```
 
+#### enable libvirtd
+
+```bash
 sudo systemctl enable --now libvirtd
 ```
 
@@ -43,6 +47,7 @@ curl -OL "https://raw.githubusercontent.com/digitalstudium/vmkube/refs/heads/mai
 ```
 
 ### Create cconfig
+
 ```bash
 vmkube initconfig
 ```
@@ -73,4 +78,4 @@ kubectl get nodes
 sudo vmkube down
 ```
 
-PRs and issues are welcomed! 
+PRs and issues are welcomed!
